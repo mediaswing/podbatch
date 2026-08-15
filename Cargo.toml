@@ -1,0 +1,31 @@
+[package]
+name = "podbatch"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Podcast Downloader: point it at an OPML subscription list and it downloads the episodes, one folder per podcast."
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+eframe = "0.36.1"
+egui = "0.36.1"
+dirs = "6.0.0"
+futures-util = "0.3.34"
+rfd = "0.17.2"
+# `rustls-no-provider` rather than `rustls`: the default provider is aws-lc,
+# whose build wants CMake and an assembler on Windows. ring ships pre-generated
+# objects for the Windows targets, so `cargo build` there needs nothing but the
+# MSVC toolchain. The provider is installed on first use — see engine.rs.
+reqwest = { version = "0.13.4", default-features = false, features = ["stream", "rustls-no-provider", "http2", "charset", "gzip", "system-proxy"] }
+# Not used directly for TLS. reqwest is built without a crypto provider, so one
+# has to be chosen and installed before the first HTTPS request; this is the
+# same crate and version reqwest already links, so it compiles no extra code.
+rustls = { version = "0.23.43", default-features = false, features = ["ring"] }
+roxmltree = "0.21.1"
+# Only for the two end-of-run cues, which are WAV — no other format is needed.
+rodio = { version = "0.22.2", default-features = false, features = ["playback", "wav"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "fs", "io-util", "sync", "time"] }
+
+[profile.release]
+opt-level = 2

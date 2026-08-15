@@ -1,0 +1,24 @@
+Sound effects
+=============
+
+Both cues come from freesound.org and are released under Creative Commons Zero
+1.0 (CC0) — a dedication to the public domain, which asks for nothing in
+return. They are credited here anyway: CC0 waives the requirement, not the
+courtesy, and someone who wants more sounds that fit these ought to be able to
+find where they came from.
+
+success.wav
+    "Success" by kagateni — https://freesound.org/s/404358/
+    Licence: CC0 1.0 Universal
+
+error.wav
+    "Failure/Wrong action" by gabrielaraujo — https://freesound.org/s/242503/
+    Licence: CC0 1.0 Universal
+
+Both files are edited rather than original, and are the same edits used in the
+accessengine project they were taken from. Each was converted to mono, trimmed
+of its leading and trailing silence, given a 5 ms fade in and a 30 ms fade out
+so neither end clicks, and levelled to the same RMS loudness — a mean of
+-22.2 dB. That last step is the one that matters most: as published, the
+failure sound was around 11 dB quieter than the success one, so the sound
+telling you something went wrong would have been the one you struggled to hear.
