@@ -1,0 +1,255 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+# Builds a macOS .app and a Windows zip and — for a tag — publishes them as a
+# release. `workflow_dispatch` runs everything except the publish, which is the
+# way to check a build without shipping anything.
+#
+# The only C in the tree is ring (TLS) and the platform audio bindings, and
+# neither needs anything the runners lack — ring ships pre-generated objects for
+# the MSVC target, which is why the TLS backend is ring rather than the default
+# aws-lc, which would want CMake and an assembler on Windows. So there is no
+# toolchain setup step here.
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset_name: podbatch-macos-aarch64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset_name: podbatch-windows-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Before packaging, so a release cannot ship code whose own tests fail.
+      - name: Test
+        run: cargo test --release --target ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          VERSION=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          BIN="target/${{ matrix.target }}/release/podbatch"
+          DIST="dist/${{ matrix.asset_name }}"
+          APP="$DIST/Podcast Downloader.app"
+
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp "$BIN" "$APP/Contents/MacOS/podbatch"
+
+          # A bare binary launches, but with no bundle it has no dock identity,
+          # no display name, and no way for macOS to treat it as a real
+          # application. The document type is what makes "Open With" work for a
+          # subscription list — the app already takes a path on the command
+          # line, which is exactly what Finder passes. LSMinimumSystemVersion
+          # 11.0 is the floor for the aarch64 target.
+          cat > "$APP/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleName</key>
+              <string>Podcast Downloader</string>
+              <key>CFBundleDisplayName</key>
+              <string>Podcast Downloader</string>
+              <key>CFBundleIdentifier</key>
+              <string>io.podbatch.podbatch</string>
+              <key>CFBundleVersion</key>
+              <string>$VERSION</string>
+              <key>CFBundleShortVersionString</key>
+              <string>$VERSION</string>
+              <key>CFBundleExecutable</key>
+              <string>podbatch</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>CFBundleInfoDictionaryVersion</key>
+              <string>6.0</string>
+              <key>NSHighResolutionCapable</key>
+              <true/>
+              <key>LSMinimumSystemVersion</key>
+              <string>11.0</string>
+              <key>NSHumanReadableCopyright</key>
+              <string>Copyright (c) 2026 podbatch contributors. MIT License.</string>
+              <key>CFBundleDocumentTypes</key>
+              <array>
+                  <dict>
+                      <key>CFBundleTypeName</key>
+                      <string>OPML subscription list</string>
+                      <key>CFBundleTypeRole</key>
+                      <string>Viewer</string>
+                      <key>LSHandlerRank</key>
+                      <string>Alternate</string>
+                      <key>CFBundleTypeExtensions</key>
+                      <array>
+                          <string>opml</string>
+                      </array>
+                      <key>LSItemContentTypes</key>
+                      <array>
+                          <string>public.xml</string>
+                      </array>
+                  </dict>
+              </array>
+          </dict>
+          </plist>
+          PLIST
+
+          # arm64 refuses to execute a Mach-O whose signature does not match its
+          # contents, and assembling a bundle by hand leaves it without a
+          # _CodeSignature at all. Ad-hoc signing is not notarisation —
+          # Gatekeeper will still warn on first open — but it makes the bundle
+          # internally valid rather than broken.
+          codesign --force --sign - "$APP/Contents/MacOS/podbatch"
+          codesign --force --sign - "$APP"
+          codesign --verify --deep --strict "$APP"
+
+          # Nothing outside the system frameworks should be linked. ring is
+          # static, so if a future dependency pulls in a Homebrew dylib the
+          # release would run only on a machine that happens to have Homebrew —
+          # fail here instead of shipping it.
+          leaked=$(otool -L "$APP/Contents/MacOS/podbatch" | tail -n +2 | awk '{print $1}' \
+            | grep -v '^/usr/lib/' | grep -v '^/System/' || true)
+          if [ -n "$leaked" ]; then
+            echo "error: the binary links libraries that will not exist on a user's Mac:"
+            echo "$leaked"
+            exit 1
+          fi
+
+          # The font is compiled into the binary, so its licence has to travel
+          # with the download to satisfy the Ubuntu Font Licence. The sound
+          # credits are CC0 and need not travel, but they cost nothing and the
+          # recordings deserve the attribution.
+          cp README.md LICENSE "$DIST/"
+          cp assets/fonts/UBUNTU-FONT-LICENCE-1.0.txt "$DIST/"
+          cp assets/sounds/CREDITS.txt "$DIST/SOUND-CREDITS.txt"
+          cd dist && zip -r "../${{ matrix.asset_name }}.zip" "${{ matrix.asset_name }}"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $bin = "target/${{ matrix.target }}/release/podbatch.exe"
+          $dist = "dist/${{ matrix.asset_name }}"
+          New-Item -ItemType Directory -Path $dist -Force | Out-Null
+          Copy-Item $bin "$dist/"
+          Copy-Item README.md, LICENSE "$dist/"
+          Copy-Item assets/fonts/UBUNTU-FONT-LICENCE-1.0.txt "$dist/"
+          Copy-Item assets/sounds/CREDITS.txt "$dist/SOUND-CREDITS.txt"
+
+          # The Visual C++ runtime. Not part of Windows — it ships with the VC++
+          # Redistributable — and Rust's MSVC target links the CRT dynamically,
+          # so on a machine without the redistributable the app cannot start at
+          # all. (The api-ms-win-crt-* imports alongside it are the Universal
+          # CRT, which *is* part of Windows 10+, which is why this is easy to
+          # miss.) Copying app-local from the VS redist directory is explicitly
+          # permitted by Microsoft and changes nothing about how anything builds.
+          $installerDir = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer"
+          $vsInstall = & "$installerDir\vswhere.exe" -latest -products * -property installationPath
+          $crt = Get-ChildItem -Path "$vsInstall\VC\Redist\MSVC" -Recurse -Filter "vcruntime140.dll" `
+            | Where-Object { $_.FullName -match '\\x64\\' } `
+            | Sort-Object FullName | Select-Object -Last 1
+          if (-not $crt) { throw "could not locate the x64 VC++ redistributable DLLs" }
+          Write-Host "Bundling VC++ runtime from $($crt.Directory.FullName)"
+          Copy-Item "$($crt.Directory.FullName)\*.dll" "$dist/"
+
+          # Read the real import table rather than trusting the list below.
+          # Anything imported must be either part of Windows or present in the
+          # payload; hand-maintaining that judgement is exactly how a missing
+          # runtime DLL survives several releases unnoticed.
+          $vcvars = "$vsInstall\VC\Auxiliary\Build\vcvars64.bat"
+          $dumpOut = & cmd /c "`"$vcvars`" >nul 2>&1 && dumpbin /dependents `"$dist\podbatch.exe`""
+          $imports = $dumpOut | Select-String -Pattern '^\s{4}(\S+\.dll)$' `
+            | ForEach-Object { $_.Matches[0].Groups[1].Value.ToLower() }
+          if (-not $imports) { throw "could not read the import table of podbatch.exe" }
+
+          $shipped = Get-ChildItem $dist -Filter *.dll | ForEach-Object { $_.Name.ToLower() }
+
+          # The API-set contract DLLs. These are prefixes, matched separately
+          # from the exact names below — folding both into one anchored regex
+          # makes `api-ms-win-` only match the literal string "api-ms-win-.dll",
+          # so every real API-set name fails the check.
+          $systemPrefixes = @('api-ms-win-', 'ext-ms-win-')
+
+          # Present on any supported Windows. uiautomationcore is the UI
+          # Automation provider AccessKit binds to for screen reader support —
+          # load-bearing for this app, whose whole left pane is tick boxes;
+          # avrt, ksuser, mmdevapi and audioses are WASAPI, for the two
+          # end-of-run cues; comdlg32 is the file picker; bcryptprimitives backs
+          # the system RNG under TLS.
+          $systemExact = @(
+            'kernel32.dll', 'user32.dll', 'gdi32.dll', 'advapi32.dll', 'shell32.dll',
+            'ole32.dll', 'oleaut32.dll', 'combase.dll', 'shlwapi.dll', 'comdlg32.dll',
+            'comctl32.dll', 'ws2_32.dll', 'crypt32.dll', 'secur32.dll', 'bcrypt.dll',
+            'bcryptprimitives.dll', 'ncrypt.dll', 'ntdll.dll', 'rpcrt4.dll',
+            'setupapi.dll', 'cfgmgr32.dll', 'dwmapi.dll', 'uxtheme.dll',
+            'uiautomationcore.dll', 'oleacc.dll', 'd3d11.dll', 'd3d12.dll',
+            'dxgi.dll', 'd3dcompiler_47.dll', 'opengl32.dll', 'winmm.dll',
+            'avrt.dll', 'ksuser.dll', 'mmdevapi.dll', 'audioses.dll',
+            'imm32.dll', 'version.dll', 'userenv.dll', 'powrprof.dll',
+            'propsys.dll', 'dbghelp.dll', 'hid.dll', 'dcomp.dll', 'msvcrt.dll',
+            'winhttp.dll', 'iphlpapi.dll', 'dnsapi.dll', 'normaliz.dll'
+          )
+
+          $missing = $imports | Where-Object {
+            $name = $_
+            $matchesPrefix = @($systemPrefixes | Where-Object { $name.StartsWith($_) }).Count -gt 0
+            -not $matchesPrefix -and $systemExact -notcontains $name -and $shipped -notcontains $name
+          }
+          if ($missing) {
+            throw "podbatch.exe imports DLLs that are neither part of Windows nor bundled: $($missing -join ', ')"
+          }
+          Write-Host "Import check passed. Bundled: $($shipped -join ', ')"
+
+          Compress-Archive -Path $dist -DestinationPath "${{ matrix.asset_name }}.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: ${{ matrix.asset_name }}.zip
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      # Both zips land one directory deep, under the artifact name each was
+      # uploaded as.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          gh release create "$TAG" \
+            --title "Podcast Downloader $TAG" \
+            --generate-notes \
+            artifacts/*/*.zip

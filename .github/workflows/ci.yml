@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+# Runs the tests on both platforms the app ships to, on every pull request and
+# on main. release.yml also tests, but only at tag time — by which point a
+# failure means an aborted release rather than a comment on a diff.
+#
+# Deliberately not a release build: the tests are the point here, and a debug
+# build gets to them in a fraction of the time. The release profile is still
+# exercised end to end by release.yml before anything is published.
+#
+# There is no `cargo fmt --check` job. One belongs here, but it was not added
+# blind: the machine this was written on has no working `cargo fmt`, so a format
+# gate could not be verified before being committed and would have failed the
+# first push for reasons unrelated to the code. Add it — and run `cargo fmt`
+# once — from a machine that can.
+
+# Nothing here writes to the repository.
+permissions:
+  contents: read
+
+# A second push to a pull request makes the first run irrelevant, so it is
+# cancelled rather than left to finish. Runs on main are not cancelled: each
+# commit there is a distinct thing to know the state of.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: clippy
+
+      # Not only unit tests: the suite stands up a real HTTP server on a
+      # loopback port and drives the download engine through it, so this covers
+      # the socket, the filesystem and the resume path rather than a mock of
+      # them. Both platforms run it, because the file naming is where the two
+      # differ most.
+      - name: Test
+        run: cargo test --target ${{ matrix.target }}
+
+      # Clippy on both platforms rather than one: the parts most likely to rot
+      # are the ones a single platform cannot see — `reveal` in src/app.rs has a
+      # branch per OS behind `cfg`, and whichever is not being built is not
+      # being linted either. Warnings are errors so they cannot pile up; the
+      # tree is clean on both as of this workflow being added.
+      - name: Clippy
+        run: cargo clippy --all-targets --target ${{ matrix.target }} -- -D warnings
