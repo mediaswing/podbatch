@@ -89,6 +89,18 @@ const MEDIA_EXTENSIONS: &[&str] = &[
     "mp4", "m4v", "mov", "webm", "mkv", "avi",
 ];
 
+/// Whether a file on disk is one we can hand to FFmpeg.
+///
+/// The same allowlist the downloader writes with, read back: anything this app
+/// put in a podcast folder is transcribable by definition, and the Transcripts
+/// tab uses this to keep artwork and notes out of the list.
+pub fn is_media(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| MEDIA_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
 /// Pull a file extension out of an enclosure URL, falling back to the MIME type.
 /// Many feeds hand out tracking URLs with no extension at all.
 pub fn extension_for(url: &str, mime: Option<&str>) -> String {

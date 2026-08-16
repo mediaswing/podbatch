@@ -134,7 +134,10 @@ impl Cancel {
     pub fn cancel(&self) {
         self.0.store(true, Ordering::Relaxed);
     }
-    fn is_cancelled(&self) -> bool {
+    /// Public because the transcription engine shares this handle: stopping a
+    /// run means the same thing to both, and a second flag would be a second
+    /// thing to remember to set.
+    pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Relaxed)
     }
 }

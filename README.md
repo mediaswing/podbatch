@@ -9,7 +9,7 @@ connection, are both things a window does better than a terminal.
 
 ## The window
 
-Two tabs, both spanning the full width of the window.
+Three tabs, all spanning the full width of the window.
 
 **Downloads** is where the work happens. The subscription list goes in at the
 top — choose an OPML file, or drop one onto the window. Underneath, the pane is
@@ -19,6 +19,36 @@ the width beneath both.
 
 Everything arrives ticked, because the usual answer is "all of them"; untick the
 few you don't want. **All** and **None** are there for when it isn't.
+
+**Transcripts** turns episodes you already have into text. Choose a folder, tick
+the episodes, and each one is written out as a `.txt` beside its audio.
+
+It leans on programs it does not ship. FFmpeg converts the audio, because
+Whisper reads 16 kHz WAV and a podcast is an mp3; whisper.cpp does the
+listening. The tab lists what it needs, says what each piece is for, and offers
+to install the missing ones — **nothing is installed without being asked**, and
+every question names the exact command it is about to run. Where a step needs an
+administrator password, the app will not run it for you: it shows the command
+and opens a terminal, because a window has no honest place to collect a
+password.
+
+Speakers are marked "Speaker 1", "Speaker 2" and so on. Two things are worth
+knowing about those numbers:
+
+- Whisper hears **that** the voice changed, never **whose** it is. On its own it
+  therefore starts a new number at every turn, so one person ends up with
+  several numbers over an episode.
+- Ollama, if you have it, can read the turns afterwards and work out which are
+  the same person, so a number stays attached to somebody. This is optional and
+  off the critical path: without it you still get a full transcript, just with
+  the blunter numbering. It never hears the audio — it is reading words — so it
+  can get this wrong, and the transcript says which of the two kinds of
+  numbering it got.
+
+How well the turns come out depends a great deal on the recording. A
+conversation between two or three people works well. A narrated documentary with
+pre-recorded inserts may yield no turn marks at all, which is the model being
+honest rather than the app failing.
 
 **Settings** holds what gets set once and then left alone:
 

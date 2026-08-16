@@ -19,6 +19,8 @@ mod opml;
 mod sound;
 mod tags;
 mod theme;
+mod tools;
+mod transcribe;
 mod util;
 
 /// The name shown to the user, which is not the name of the binary.

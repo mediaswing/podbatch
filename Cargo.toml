@@ -30,6 +30,10 @@ tokio = { version = "1.53.1", features = ["rt-multi-thread", "fs", "io-util", "s
 # actually is has to live in its tags. Default features off: the only one is
 # picture decoding, and we never read the artwork we take care to preserve.
 id3 = { version = "1.17.1", default-features = false }
+# Only for talking to Ollama, whose API is JSON both ways. Hand-rolling the
+# escaping for a request that carries arbitrary transcript text is exactly the
+# sort of thing that works until an episode contains a quotation mark.
+serde_json = "1.0.145"
 
 [profile.release]
 opt-level = 2

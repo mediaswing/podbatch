@@ -31,6 +31,8 @@ use crate::logs;
 use crate::opml;
 use crate::sound::{self, Cue};
 use crate::theme::{self, CONTROL_HEIGHT, PROGRESS_HEIGHT};
+use crate::tools;
+use crate::transcribe;
 use crate::util::{human_bytes, human_duration, human_rate, transfer_seconds};
 
 /// How many output lines to keep. Long enough to cover a whole run, short enough
@@ -58,6 +60,7 @@ const MARK_FAILED: &str = "✖";
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tab {
     Downloads,
+    Transcripts,
     Settings,
 }
 
@@ -75,6 +78,8 @@ enum Action {
     Show(Tab),
     SelectAll,
     SelectNone,
+    ChooseAudioFolder,
+    Transcribe,
 }
 
 /// The shortcut table: what it does, the keys, and how it is described.
@@ -105,13 +110,28 @@ fn shortcuts() -> Vec<(Action, egui::KeyboardShortcut, &'static str)> {
             "Stop the run in progress, after asking",
         ),
         (
+            Action::ChooseAudioFolder,
+            KeyboardShortcut::new(command_shift, Key::O),
+            "Choose a folder of episodes to transcribe",
+        ),
+        (
+            Action::Transcribe,
+            KeyboardShortcut::new(command_shift, Key::Enter),
+            "Start transcribing",
+        ),
+        (
             Action::Show(Tab::Downloads),
             KeyboardShortcut::new(command, Key::Num1),
             "Go to the Downloads tab",
         ),
         (
-            Action::Show(Tab::Settings),
+            Action::Show(Tab::Transcripts),
             KeyboardShortcut::new(command, Key::Num2),
+            "Go to the Transcripts tab",
+        ),
+        (
+            Action::Show(Tab::Settings),
+            KeyboardShortcut::new(command, Key::Num3),
             "Go to the Settings tab",
         ),
         (
@@ -143,6 +163,17 @@ enum Dialog {
     Confirm(Plan),
     /// A run is going and something asked for it to stop.
     Stop,
+    /// Something is about to be put on the user's machine.
+    ///
+    /// Never skipped and never batched: the user's instruction is that nothing
+    /// is installed without asking, so every package, every model and every
+    /// download is its own question with the exact command written out in it.
+    Install { tool: tools::Tool, install: tools::Install },
+    /// Transcribing is minutes per episode, so the size of the job is quoted
+    /// before it starts for the same reason a download is.
+    Transcribe { files: usize, labelling: bool },
+    /// A transcription run is going and something asked for it to stop.
+    StopTranscribing,
 }
 
 impl Dialog {
@@ -156,8 +187,31 @@ impl Dialog {
                 human_bytes(plan.bytes)
             ),
             Dialog::Stop => "\"stop downloading?\"".to_string(),
+            Dialog::Install { tool, .. } => format!("\"install {}?\"", tool.label()),
+            Dialog::Transcribe { files, .. } => format!("\"transcribe {files} file(s)?\""),
+            Dialog::StopTranscribing => "\"stop transcribing?\"".to_string(),
         }
     }
+}
+
+/// A file in the chosen folder, and how far its transcript has got.
+struct AudioRow {
+    path: PathBuf,
+    name: String,
+    selected: bool,
+    status: transcribe::Status,
+    /// How far through the audio Whisper is, once it is the one running.
+    fraction: f32,
+    /// Whether a transcript is already sitting beside it, worked out when the
+    /// folder is scanned rather than every frame.
+    transcribed: bool,
+}
+
+/// What the installer thread has to say.
+enum InstallUpdate {
+    Line(String),
+    Progress { done: u64, total: Option<u64> },
+    Finished(Result<(), String>),
 }
 
 /// A speed to estimate from, and where it came from — which decides how the
@@ -333,6 +387,29 @@ pub struct PodBatchApp {
     measured_rate: Option<f64>,
     /// When the last cue was played, for [`CUE_GAP`].
     last_cue: Option<Instant>,
+
+    // ---- Transcripts ------------------------------------------------------
+    audio_dir: Option<PathBuf>,
+    audio: Vec<AudioRow>,
+    /// What the machine was found to have, last time we looked. Surveyed on
+    /// demand rather than every frame: it shells out to look for binaries, and
+    /// doing that sixty times a second would be absurd.
+    tools: Vec<tools::Found>,
+    /// Whether to spend the extra minutes keeping a speaker's number attached
+    /// to the same person. See the note in [`transcribe`].
+    label_speakers: bool,
+    skip_transcribed: bool,
+
+    transcribing: bool,
+    transcribe_cancel: Option<Cancel>,
+    transcribe_rx: Option<UnboundedReceiver<transcribe::Update>>,
+
+    /// The install running now, if any, and what it has said. Only one at a
+    /// time — they are all package-manager operations and running two at once
+    /// is how a lock file gets fought over.
+    installing: Option<tools::Tool>,
+    install_rx: Option<UnboundedReceiver<InstallUpdate>>,
+    install_progress: Option<(u64, Option<u64>)>,
 }
 
 impl PodBatchApp {
@@ -371,6 +448,20 @@ impl PodBatchApp {
             downloads_began: None,
             measured_rate: None,
             last_cue: None,
+            audio_dir: None,
+            audio: Vec::new(),
+            // Empty rather than surveyed: `new` runs before the window is up,
+            // and looking for six programs is not something to make the first
+            // frame wait on. The tab surveys the first time it is opened.
+            tools: Vec::new(),
+            label_speakers: true,
+            skip_transcribed: true,
+            transcribing: false,
+            transcribe_cancel: None,
+            transcribe_rx: None,
+            installing: None,
+            install_rx: None,
+            install_progress: None,
         };
         cc.egui_ctx.set_theme(app.theme);
 
@@ -600,15 +691,59 @@ impl PodBatchApp {
                     self.ask(Dialog::Stop);
                 }
             }
-            Action::Show(tab) => self.tab = tab,
-            Action::SelectAll => {
-                if !self.running {
-                    self.feeds.iter_mut().for_each(|f| f.selected = true);
+            Action::Show(tab) => {
+                self.tab = tab;
+                // The tab is no use until it knows what the machine has, and
+                // this is the first moment it is worth the cost of finding out.
+                if tab == Tab::Transcripts && self.tools.is_empty() {
+                    self.survey_tools();
                 }
             }
-            Action::SelectNone => {
-                if !self.running {
-                    self.feeds.iter_mut().for_each(|f| f.selected = false);
+            // Ticking is per-tab: the same chord means the podcasts on one and
+            // the episodes on the other, so it always acts on the list in view.
+            Action::SelectAll => match self.tab {
+                Tab::Transcripts => {
+                    if !self.transcribing {
+                        self.audio.iter_mut().for_each(|a| a.selected = true);
+                    }
+                }
+                _ => {
+                    if !self.running {
+                        self.feeds.iter_mut().for_each(|f| f.selected = true);
+                    }
+                }
+            },
+            Action::SelectNone => match self.tab {
+                Tab::Transcripts => {
+                    if !self.transcribing {
+                        self.audio.iter_mut().for_each(|a| a.selected = false);
+                    }
+                }
+                _ => {
+                    if !self.running {
+                        self.feeds.iter_mut().for_each(|f| f.selected = false);
+                    }
+                }
+            },
+            Action::ChooseAudioFolder => {
+                if !self.transcribing
+                    && let Some(dir) = rfd::FileDialog::new()
+                        .set_directory(existing_ancestor(
+                            self.audio_dir.as_deref().unwrap_or(&self.out_dir),
+                        ))
+                        .pick_folder()
+                {
+                    self.tab = Tab::Transcripts;
+                    if self.tools.is_empty() {
+                        self.survey_tools();
+                    }
+                    self.load_audio_folder(dir);
+                }
+            }
+            Action::Transcribe => {
+                if !self.transcribing && self.dialog.is_none() {
+                    self.tab = Tab::Transcripts;
+                    self.ask_transcribe();
                 }
             }
         }
@@ -690,6 +825,24 @@ impl PodBatchApp {
                 self.pending_plan = None;
                 self.stop();
             }
+            // "Yes" means different things to the three kinds of install: run
+            // it, open the page that explains it, or open a terminal to run it
+            // in. Only the first actually changes the machine from in here.
+            Dialog::Install { tool, install } => match install {
+                tools::Install::Guided { .. } => {
+                    if let Err(e) = tools::open_terminal() {
+                        self.say(OutputKind::Bad, e);
+                    }
+                }
+                tools::Install::Manual { ref url, .. } => {
+                    if let Err(e) = tools::open_url(url) {
+                        self.say(OutputKind::Bad, e);
+                    }
+                }
+                _ => self.start_install(tool, install),
+            },
+            Dialog::Transcribe { .. } => self.start_transcribing(),
+            Dialog::StopTranscribing => self.stop_transcribing(),
         }
     }
 
@@ -706,6 +859,9 @@ impl PodBatchApp {
                     self.ask(Dialog::Confirm(plan));
                 }
             }
+            // Saying no to any of these is simply not doing it. Nothing is
+            // waiting on the answer, so there is nothing to release.
+            Dialog::Install { .. } | Dialog::Transcribe { .. } | Dialog::StopTranscribing => {}
         }
     }
 
@@ -750,6 +906,52 @@ impl PodBatchApp {
                 "Keep downloading",
                 "confirm-stop",
             ),
+            Dialog::Install { tool, install } => install_question(*tool, install),
+            Dialog::Transcribe { files, labelling } => (
+                format!("Transcribe {}?", count(*files, "episode")),
+                vec![
+                    "Transcribing listens to the whole episode, so it takes a few minutes \
+                     of the machine's full attention per file."
+                        .to_string(),
+                    match labelling {
+                        true => "Speakers will be followed through each episode, so a number \
+                                 should mean the same person throughout. It is worked out from \
+                                 the words rather than the voices, so check anything that \
+                                 matters."
+                            .to_string(),
+                        false => "Speakers will be numbered turn by turn: the number changes \
+                                  whenever the voice changes, so one person will have several \
+                                  numbers."
+                            .to_string(),
+                    },
+                    "Each transcript is written as a .txt file beside its audio.".to_string(),
+                ],
+                "▶ Transcribe",
+                "Cancel",
+                "confirm-transcribe",
+            ),
+            Dialog::StopTranscribing => (
+                "Stop transcribing?".to_string(),
+                vec![
+                    "The episode part way through will be left without a transcript.".to_string(),
+                    "The ones already written stay where they are.".to_string(),
+                ],
+                "■ Stop",
+                "Keep transcribing",
+                "confirm-stop-transcribing",
+            ),
+        };
+
+        // A command the user has to run themselves is shown in full, and can be
+        // copied — retyping a `curl … | bash` line by hand is how people end up
+        // running something subtly different from what they were shown.
+        let command = match &dialog {
+            Dialog::Install { install, .. } => match install {
+                tools::Install::Guided { command, .. } => Some(command.clone()),
+                tools::Install::Run { display, .. } => Some(display.clone()),
+                _ => None,
+            },
+            _ => None,
         };
 
         // True only on the frame the box appears, which is also the frame a
@@ -765,6 +967,23 @@ impl PodBatchApp {
                 ui.label(line);
                 ui.add_space(2.0);
             }
+
+            if let Some(command) = &command {
+                ui.add_space(8.0);
+                egui::Frame::default()
+                    .fill(ui.visuals().extreme_bg_color)
+                    .inner_margin(8.0)
+                    .corner_radius(4.0)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(RichText::new(command).monospace()).wrap(),
+                        );
+                    });
+                if ui.button("Copy command").clicked() {
+                    ui.ctx().copy_text(command.clone());
+                }
+            }
+
             ui.add_space(14.0);
 
             ui.horizontal(|ui| {
@@ -1041,7 +1260,11 @@ impl PodBatchApp {
     /// navigation the app has, so they are worth being unmissable and easy to
     /// hit, and a target that spans half the window is both.
     fn tab_bar(&mut self, ui: &mut Ui) {
-        let tabs = [(Tab::Downloads, "Downloads"), (Tab::Settings, "Settings")];
+        let tabs = [
+            (Tab::Downloads, "Downloads"),
+            (Tab::Transcripts, "Transcripts"),
+            (Tab::Settings, "Settings"),
+        ];
         let gaps = ui.spacing().item_spacing.x * (tabs.len() - 1) as f32;
         let width = ((ui.available_width() - gaps) / tabs.len() as f32).max(1.0);
 
@@ -1052,7 +1275,7 @@ impl PodBatchApp {
                     .add_sized(egui::vec2(width, CONTROL_HEIGHT), button)
                     .clicked()
                 {
-                    self.tab = tab;
+                    self.perform(Action::Show(tab));
                 }
             }
         });
@@ -1389,6 +1612,745 @@ impl PodBatchApp {
         theme::percentage_across(ui, bar.rect, fraction);
     }
 
+    // ---- transcripts ------------------------------------------------------
+
+    /// Look the machine over and remember what it found.
+    ///
+    /// Called when the tab is first opened, after any install, and whenever the
+    /// user presses Check again — never per frame. It shells out looking for
+    /// half a dozen binaries and asks Ollama what it has, which is far too much
+    /// to do at sixty frames a second.
+    fn survey_tools(&mut self) {
+        self.tools = tools::survey();
+        let missing: Vec<&str> = self
+            .tools
+            .iter()
+            .filter(|f| !f.presence.is_ready() && !f.tool.optional())
+            .map(|f| f.tool.label())
+            .collect();
+        logs::debug(format!(
+            "transcription tools: {} missing{}",
+            missing.len(),
+            match missing.is_empty() {
+                true => String::new(),
+                false => format!(" ({})", missing.join(", ")),
+            }
+        ));
+    }
+
+    fn tool_ready(&self, tool: tools::Tool) -> bool {
+        self.tools
+            .iter()
+            .any(|f| f.tool == tool && f.presence.is_ready())
+    }
+
+    fn tool_path(&self, tool: tools::Tool) -> Option<PathBuf> {
+        self.tools
+            .iter()
+            .find(|f| f.tool == tool)
+            .and_then(|f| f.path.clone())
+    }
+
+    /// Everything a transcript needs, present. The two Ollama entries are not
+    /// counted — a run without them is a run with blunter speaker numbers, not
+    /// a run that cannot happen.
+    fn can_transcribe(&self) -> bool {
+        [
+            tools::Tool::Ffmpeg,
+            tools::Tool::Whisper,
+            tools::Tool::WhisperModel,
+        ]
+        .iter()
+        .all(|t| self.tool_ready(*t))
+    }
+
+    /// Read a folder and list the audio in it.
+    fn load_audio_folder(&mut self, dir: PathBuf) {
+        let files = transcribe::audio_in(&dir);
+        logs::debug(format!(
+            "scanned {} — {} audio file(s)",
+            dir.display(),
+            files.len()
+        ));
+
+        self.audio = files
+            .into_iter()
+            .map(|path| {
+                let transcribed = transcribe::transcript_path(&path).is_file();
+                AudioRow {
+                    name: path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    // Anything already transcribed starts unticked: the common
+                    // case for re-opening a folder is "do the new ones", and
+                    // re-transcribing an episode costs minutes for a file that
+                    // is already sitting there.
+                    selected: !transcribed,
+                    status: match transcribed {
+                        true => transcribe::Status::Done,
+                        false => transcribe::Status::Pending,
+                    },
+                    fraction: 0.0,
+                    transcribed,
+                    path,
+                }
+            })
+            .collect();
+
+        if self.audio.is_empty() {
+            self.say(
+                OutputKind::Muted,
+                format!("No audio files in {}", elide_path(&dir)),
+            );
+        } else {
+            self.say(
+                OutputKind::Plain,
+                format!(
+                    "{} in {}",
+                    count(self.audio.len(), "audio file"),
+                    elide_path(&dir)
+                ),
+            );
+        }
+        self.audio_dir = Some(dir);
+    }
+
+    fn ticked_audio(&self) -> Vec<PathBuf> {
+        self.audio
+            .iter()
+            .filter(|a| a.selected)
+            .map(|a| a.path.clone())
+            .collect()
+    }
+
+    /// Ask before transcribing, for the same reason a download asks: this is
+    /// minutes per episode of the machine's full attention.
+    fn ask_transcribe(&mut self) {
+        let files = self.ticked_audio().len();
+        if files == 0 || self.transcribing || !self.can_transcribe() {
+            return;
+        }
+        let labelling = self.label_speakers && self.tool_ready(tools::Tool::OllamaModel);
+        self.ask(Dialog::Transcribe { files, labelling });
+    }
+
+    fn start_transcribing(&mut self) {
+        let files = self.ticked_audio();
+        let (Some(ffmpeg), Some(whisper), Some(model)) = (
+            self.tool_path(tools::Tool::Ffmpeg),
+            self.tool_path(tools::Tool::Whisper),
+            self.tool_path(tools::Tool::WhisperModel),
+        ) else {
+            self.say(
+                OutputKind::Bad,
+                "Something needed for transcribing has gone missing — press Check again.".into(),
+            );
+            return;
+        };
+
+        // Clear the marks from any previous run so the list reports this one
+        // rather than a mixture of the two.
+        for row in self.audio.iter_mut().filter(|a| a.selected) {
+            row.status = transcribe::Status::Pending;
+            row.fraction = 0.0;
+        }
+
+        let labelling = self.label_speakers && self.tool_ready(tools::Tool::OllamaModel);
+        self.say(
+            OutputKind::Plain,
+            format!(
+                "Transcribing {}{}",
+                count(files.len(), "file"),
+                match labelling {
+                    true => ", following speakers through each episode",
+                    false => ", numbering each speaker turn",
+                }
+            ),
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = Cancel::new();
+        transcribe::spawn(
+            transcribe::Settings {
+                files,
+                ffmpeg,
+                whisper,
+                model,
+                label_speakers: labelling,
+                skip_existing: self.skip_transcribed,
+            },
+            tx,
+            cancel.clone(),
+            Arc::clone(&self.notify),
+        );
+
+        self.transcribe_rx = Some(rx);
+        self.transcribe_cancel = Some(cancel);
+        self.transcribing = true;
+    }
+
+    fn stop_transcribing(&mut self) {
+        if let Some(cancel) = &self.transcribe_cancel {
+            cancel.cancel();
+            self.say(
+                OutputKind::Muted,
+                "Stopping — finishing the episode in hand…".into(),
+            );
+        }
+    }
+
+    /// Begin an install the user has agreed to, on a thread of its own.
+    fn start_install(&mut self, tool: tools::Tool, install: tools::Install) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let notify = Arc::clone(&self.notify);
+
+        // Guided and Manual never reach here — they are not things we run, and
+        // the dialog for them offers a terminal rather than a Yes.
+        let job = match install {
+            tools::Install::Run { program, args, display } => {
+                self.say(OutputKind::Plain, format!("Running: {display}"));
+                Some(Ok((program, args)))
+            }
+            tools::Install::Download { url, to, bytes } => {
+                self.say(
+                    OutputKind::Plain,
+                    format!("Downloading {} ({})", tool.label(), human_bytes(bytes)),
+                );
+                Some(Err((url, to)))
+            }
+            tools::Install::Guided { .. } | tools::Install::Manual { .. } => None,
+        };
+        let Some(job) = job else { return };
+
+        let cancel = Cancel::new();
+        self.transcribe_cancel = Some(cancel.clone());
+
+        std::thread::Builder::new()
+            .name("podbatch-install".into())
+            .spawn(move || {
+                let send = |u: InstallUpdate| {
+                    let _ = tx.send(u);
+                    notify();
+                };
+                let result = match job {
+                    Ok((program, args)) => {
+                        let send_line = |line: String| send(InstallUpdate::Line(line));
+                        tools::install(&program, &args, send_line)
+                    }
+                    Err((url, to)) => tools::download(
+                        &url,
+                        &to,
+                        |done, total| send(InstallUpdate::Progress { done, total }),
+                        || cancel.is_cancelled(),
+                    ),
+                };
+                send(InstallUpdate::Finished(result));
+            })
+            .expect("spawn install thread");
+
+        self.installing = Some(tool);
+        self.install_rx = Some(rx);
+        self.install_progress = None;
+    }
+
+    /// Drain the installer thread.
+    fn drain_install(&mut self) {
+        let Some(rx) = self.install_rx.as_mut() else {
+            return;
+        };
+        let mut updates = Vec::new();
+        while let Ok(update) = rx.try_recv() {
+            updates.push(update);
+        }
+
+        for update in updates {
+            match update {
+                InstallUpdate::Line(line) => {
+                    // Package managers are chatty and most of it is noise; the
+                    // debug log takes the lot and the window takes the lines
+                    // that say something happened.
+                    logs::debug(format!("install: {line}"));
+                    let interesting = ["Error", "error:", "Warning", "==>", "Pouring", "🍺"];
+                    if interesting.iter().any(|m| line.contains(m)) {
+                        let kind = match line.contains("rror") {
+                            true => OutputKind::Bad,
+                            false => OutputKind::Muted,
+                        };
+                        self.say(kind, line);
+                    }
+                }
+                InstallUpdate::Progress { done, total } => {
+                    self.install_progress = Some((done, total));
+                }
+                InstallUpdate::Finished(result) => {
+                    let tool = self.installing.take();
+                    self.install_rx = None;
+                    self.install_progress = None;
+                    self.transcribe_cancel = None;
+
+                    let label = tool.map(|t| t.label()).unwrap_or("It");
+                    match result {
+                        Ok(()) => {
+                            self.say(OutputKind::Good, format!("{label} is installed."));
+                            // Installing Ollama does not start it, and a server
+                            // that isn't running looks exactly like one that
+                            // isn't installed. Start it before re-surveying so
+                            // the tab doesn't report a fresh install as missing.
+                            if tool == Some(tools::Tool::Ollama) {
+                                tools::start_ollama().ok();
+                                std::thread::sleep(Duration::from_millis(600));
+                            }
+                        }
+                        Err(e) => self.say(OutputKind::Bad, format!("{label} — {e}")),
+                    }
+                    self.survey_tools();
+                    self.play(CUE_RUN_ENDED, Cue::Success);
+                }
+            }
+        }
+    }
+
+    /// Drain the transcription engine.
+    fn drain_transcribe(&mut self) {
+        let Some(rx) = self.transcribe_rx.as_mut() else {
+            return;
+        };
+        let mut updates = Vec::new();
+        while let Ok(update) = rx.try_recv() {
+            updates.push(update);
+        }
+
+        let mut cue: Option<(u8, Cue)> = None;
+        let mut best = |rank: u8, c: Cue| {
+            if cue.is_none_or(|(existing, _)| rank >= existing) {
+                cue = Some((rank, c));
+            }
+        };
+
+        for update in updates {
+            match update {
+                transcribe::Update::Status { file, status } => {
+                    if let Some(row) = self.audio.get_mut(file) {
+                        if matches!(status, transcribe::Status::Done) {
+                            row.transcribed = true;
+                            row.fraction = 1.0;
+                        }
+                        row.status = status.clone();
+                    }
+                    match status {
+                        transcribe::Status::Done => best(CUE_EPISODE_DONE, Cue::Success),
+                        transcribe::Status::Failed(_) => best(CUE_SOMETHING_FAILED, Cue::Failure),
+                        _ => {}
+                    }
+                }
+                transcribe::Update::Progress { file, fraction } => {
+                    if let Some(row) = self.audio.get_mut(file) {
+                        row.fraction = fraction;
+                    }
+                }
+                // The transcript as it appears. Muted: it is the thing being
+                // produced rather than a report on how it went, and colouring
+                // it like an outcome would drown the outcomes it sits between.
+                transcribe::Update::Line { text } => {
+                    self.say_as(OutputKind::Muted, logs::Outcome::Note, text)
+                }
+                transcribe::Update::Log(text) => self.say(OutputKind::Plain, text),
+                transcribe::Update::Problem(text) => self.say(OutputKind::Bad, text),
+                transcribe::Update::Finished { cancelled } => {
+                    self.transcribing = false;
+                    self.transcribe_rx = None;
+                    self.transcribe_cancel = None;
+                    let done = self
+                        .audio
+                        .iter()
+                        .filter(|a| matches!(a.status, transcribe::Status::Done))
+                        .count();
+                    self.say(
+                        match cancelled {
+                            true => OutputKind::Muted,
+                            false => OutputKind::Good,
+                        },
+                        match cancelled {
+                            true => format!("Stopped — {} transcribed", count(done, "file")),
+                            false => format!("Finished — {} transcribed", count(done, "file")),
+                        },
+                    );
+                    best(CUE_RUN_ENDED, Cue::Success);
+                }
+            }
+        }
+
+        if let Some((rank, cue)) = cue {
+            self.play(rank, cue);
+        }
+    }
+
+    /// The top of the Transcripts tab: the folder, and the button that starts.
+    fn transcripts_bar(&mut self, ui: &mut Ui) {
+        let busy = self.transcribing || self.installing.is_some();
+
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Episodes").strong());
+
+            if ui
+                .add_enabled(
+                    !busy,
+                    egui::Button::new("📂 Choose folder…")
+                        .min_size(egui::vec2(190.0, CONTROL_HEIGHT)),
+                )
+                .clicked()
+            {
+                self.perform(Action::ChooseAudioFolder);
+            }
+
+            let ready = !self.ticked_audio().is_empty() && self.can_transcribe();
+            if self.transcribing {
+                if ui
+                    .add_enabled(
+                        self.dialog.is_none(),
+                        egui::Button::new("■ Stop").min_size(egui::vec2(200.0, CONTROL_HEIGHT)),
+                    )
+                    .clicked()
+                {
+                    self.ask(Dialog::StopTranscribing);
+                }
+            } else {
+                let response = ui.add_enabled(
+                    ready && !busy,
+                    egui::Button::new("▶ Transcribe")
+                        .min_size(egui::vec2(200.0, CONTROL_HEIGHT)),
+                );
+                if !self.can_transcribe() {
+                    response.on_hover_text(
+                        "Install what's needed first — the list is under the episodes.",
+                    );
+                } else if !ready {
+                    response.on_hover_text("Choose a folder and tick at least one episode.");
+                } else if response.clicked() {
+                    self.ask_transcribe();
+                }
+            }
+
+            let muted = theme::palette(ui.visuals()).muted;
+            if !self.audio.is_empty() {
+                let ticked = self.audio.iter().filter(|a| a.selected).count();
+                ui.label(
+                    RichText::new(format!("{ticked} of {} selected", self.audio.len()))
+                        .color(muted),
+                );
+            }
+        });
+
+        ui.horizontal(|ui| {
+            let muted = theme::palette(ui.visuals()).muted;
+            match &self.audio_dir {
+                Some(dir) => {
+                    ui.add(egui::Label::new(RichText::new(elide_path(dir)).color(muted)).truncate())
+                        .on_hover_text(dir.display().to_string());
+                }
+                None => {
+                    ui.label(
+                        RichText::new("No folder chosen — transcripts are written beside the audio")
+                            .color(muted),
+                    );
+                }
+            }
+        });
+    }
+
+    /// The left half of the Transcripts tab: the episodes, and what is needed
+    /// to transcribe them.
+    fn audio_pane(&mut self, ui: &mut Ui) {
+        let busy = self.transcribing;
+        let palette = theme::palette(ui.visuals());
+
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Audio files").strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_enabled(!busy && !self.audio.is_empty(), egui::Button::new("None"))
+                    .clicked()
+                {
+                    self.audio.iter_mut().for_each(|a| a.selected = false);
+                }
+                if ui
+                    .add_enabled(!busy && !self.audio.is_empty(), egui::Button::new("All"))
+                    .clicked()
+                {
+                    self.audio.iter_mut().for_each(|a| a.selected = true);
+                }
+            });
+        });
+        ui.add_space(4.0);
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .max_height(ui.available_height() * 0.55)
+            .show(ui, |ui| {
+                if self.audio.is_empty() {
+                    ui.label(
+                        RichText::new("Choose a folder of episodes above.").color(palette.muted),
+                    );
+                }
+                for row in &mut self.audio {
+                    ui.horizontal(|ui| {
+                        ui.add_enabled(!busy, egui::Checkbox::new(&mut row.selected, ""));
+                        ui.add(
+                            egui::Label::new(&row.name)
+                                .truncate(),
+                        )
+                        .on_hover_text(row.path.display().to_string());
+
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                let (text, colour) = audio_status(row, &palette);
+                                if !text.is_empty() {
+                                    ui.label(RichText::new(text).color(colour).small());
+                                }
+                            },
+                        );
+                    });
+                }
+            });
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(4.0);
+        self.tools_pane(ui);
+    }
+
+    /// What transcribing needs, what is present, and the one button that puts
+    /// each missing piece right — after asking.
+    fn tools_pane(&mut self, ui: &mut Ui) {
+        let palette = theme::palette(ui.visuals());
+        let busy = self.transcribing || self.installing.is_some();
+
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("What this needs").strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_enabled(!busy, egui::Button::new("Check again"))
+                    .on_hover_text("Look again for the programs below.")
+                    .clicked()
+                {
+                    self.survey_tools();
+                }
+            });
+        });
+        ui.add_space(4.0);
+
+        // Collected first: the loop below wants `&mut self` to open a dialog,
+        // which it cannot do while iterating `self.tools`.
+        let found: Vec<tools::Found> = self.tools.clone();
+        let manager = self
+            .tools
+            .iter()
+            .find(|f| f.tool == tools::Tool::PackageManager)
+            .map(|f| f.presence.is_ready())
+            .unwrap_or(false);
+        let mut wanted: Option<tools::Tool> = None;
+
+        egui::ScrollArea::vertical()
+            .id_salt("tools")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for entry in &found {
+                    // A package manager that is present is scaffolding, not a
+                    // requirement — saying "Homebrew ✔" every time adds a line
+                    // that never needs acting on.
+                    if entry.tool == tools::Tool::PackageManager && entry.presence.is_ready() {
+                        continue;
+                    }
+
+                    ui.horizontal(|ui| {
+                        let (mark, colour) = match &entry.presence {
+                            tools::Presence::Ready(_) => (MARK_DONE, palette.ok),
+                            tools::Presence::Missing if entry.tool.optional() => {
+                                (MARK_SKIPPED, palette.muted)
+                            }
+                            tools::Presence::Missing => (MARK_FAILED, palette.bad),
+                        };
+                        ui.label(RichText::new(mark).color(colour).strong());
+                        ui.label(entry.tool.label());
+
+                        if entry.tool.optional() {
+                            ui.label(RichText::new("optional").color(palette.muted).small());
+                        }
+
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| match &entry.presence {
+                                tools::Presence::Ready(detail) => {
+                                    ui.label(
+                                        RichText::new(detail).color(palette.muted).small(),
+                                    );
+                                }
+                                tools::Presence::Missing => {
+                                    if ui
+                                        .add_enabled(!busy, egui::Button::new("Install…"))
+                                        .on_hover_text(
+                                            "Shows exactly what will be run, and asks first.",
+                                        )
+                                        .clicked()
+                                    {
+                                        wanted = Some(entry.tool);
+                                    }
+                                }
+                            },
+                        );
+                    });
+                    ui.label(
+                        RichText::new(entry.tool.why())
+                            .color(palette.muted)
+                            .small(),
+                    );
+                    ui.add_space(4.0);
+                }
+
+                if !manager && !found.is_empty() {
+                    ui.label(
+                        RichText::new(
+                            "No package manager was found, so the pieces above have to be \
+                             installed by hand. Press Install on one and it will show you how.",
+                        )
+                        .color(palette.warn)
+                        .small(),
+                    );
+                }
+            });
+
+        if let Some(tool) = wanted {
+            let install = tools::plan(tool, tools::manager());
+            self.ask(Dialog::Install { tool, install });
+        }
+    }
+
+    /// One bar across the bottom of the Transcripts tab, for whichever long job
+    /// is running — an install, or the transcription itself.
+    ///
+    /// The two never overlap: installing is blocked while transcribing and the
+    /// other way round, so one bar can serve both without ambiguity about which
+    /// it is reporting.
+    fn transcribe_progress(&mut self, ui: &mut Ui) {
+        let muted = theme::palette(ui.visuals()).muted;
+
+        if let Some(tool) = self.installing {
+            let (fraction, detail) = match self.install_progress {
+                Some((done, Some(total))) if total > 0 => (
+                    done as f32 / total as f32,
+                    format!("{} of {}", human_bytes(done), human_bytes(total)),
+                ),
+                Some((done, _)) => (0.0, human_bytes(done)),
+                // A package manager gives no percentage, so the bar animates
+                // rather than lying about how far along it is.
+                None => (0.0, "working…".to_string()),
+            };
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("Installing {}", tool.label())).strong());
+                ui.label(RichText::new(detail).color(muted));
+            });
+            if fraction > 0.0 {
+                ui.add_sized(
+                    egui::vec2(ui.available_width(), PROGRESS_HEIGHT),
+                    egui::ProgressBar::new(fraction).show_percentage(),
+                );
+            } else {
+                ui.add_sized(
+                    egui::vec2(ui.available_width(), PROGRESS_HEIGHT),
+                    egui::ProgressBar::new(0.0).animate(true),
+                );
+            }
+            return;
+        }
+
+        if !self.transcribing {
+            return;
+        }
+
+        let total = self.audio.iter().filter(|a| a.selected).count().max(1);
+        let settled = self
+            .audio
+            .iter()
+            .filter(|a| {
+                matches!(
+                    a.status,
+                    transcribe::Status::Done
+                        | transcribe::Status::Skipped
+                        | transcribe::Status::Failed(_)
+                )
+            })
+            .count();
+        // The file in hand counts for the fraction of itself that is done, so
+        // the bar keeps moving through a long episode rather than sitting still
+        // for ten minutes and then jumping.
+        let part: f32 = self
+            .audio
+            .iter()
+            .filter(|a| matches!(a.status, transcribe::Status::Working(_)))
+            .map(|a| a.fraction)
+            .sum();
+
+        let working = self
+            .audio
+            .iter()
+            .find(|a| matches!(a.status, transcribe::Status::Working(_)));
+
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("{settled} of {total}")).strong());
+            if let Some(row) = working {
+                let stage = match &row.status {
+                    transcribe::Status::Working(s) => s.label(),
+                    _ => "",
+                };
+                ui.add(
+                    egui::Label::new(RichText::new(format!("{} — {stage}", row.name)).color(muted))
+                        .truncate(),
+                );
+            }
+        });
+        ui.add_sized(
+            egui::vec2(ui.available_width(), PROGRESS_HEIGHT),
+            egui::ProgressBar::new(((settled as f32 + part) / total as f32).clamp(0.0, 1.0))
+                .show_percentage(),
+        );
+    }
+
+    /// The right half: the same output box the Downloads tab uses, plus the
+    /// two choices that change what a transcript comes out like.
+    fn transcripts_options(&mut self, ui: &mut Ui) {
+        let busy = self.transcribing;
+        let muted = theme::palette(ui.visuals()).muted;
+
+        ui.horizontal_wrapped(|ui| {
+            ui.add_enabled(
+                !busy,
+                egui::Checkbox::new(&mut self.skip_transcribed, "Skip ones already transcribed"),
+            );
+            ui.add_space(12.0);
+
+            let has_ollama = self.tool_ready(tools::Tool::OllamaModel);
+            ui.add_enabled(
+                !busy && has_ollama,
+                egui::Checkbox::new(&mut self.label_speakers, "Follow speakers through the episode"),
+            )
+            .on_hover_text(
+                "Whisper hears when the voice changes but not whose it is, so on its own it \
+                 numbers every turn afresh. With this on, Ollama reads the turns afterwards \
+                 and works out which are the same person, so Speaker 1 stays Speaker 1. It \
+                 adds a minute or two per episode and it can get it wrong.",
+            );
+            if !has_ollama {
+                ui.label(
+                    RichText::new("(needs Ollama)")
+                        .color(muted)
+                        .small(),
+                );
+            }
+        });
+    }
+
     fn settings_pane(&mut self, ui: &mut Ui) {
         let busy = self.running;
         let muted = theme::palette(ui.visuals()).muted;
@@ -1543,6 +2505,97 @@ impl PodBatchApp {
     }
 }
 
+/// The question asked before anything is put on the machine.
+///
+/// Every branch names the thing, says what it is for, and — where there is one
+/// — shows the exact command. The three kinds differ in what "yes" does, so
+/// they differ in what the button says: a run we do, a page we open, or a
+/// terminal we open for the user to do it themselves.
+fn install_question(
+    tool: tools::Tool,
+    install: &tools::Install,
+) -> (String, Vec<String>, &'static str, &'static str, &'static str) {
+    let headline = format!("Install {}?", tool.label());
+    match install {
+        tools::Install::Run { .. } => (
+            headline,
+            vec![
+                tool.why().to_string(),
+                "This runs the command below on your machine.".to_string(),
+                // `ollama pull` fetches a model rather than a program, and the
+                // size of it is the part worth knowing before agreeing.
+                match tool {
+                    tools::Tool::OllamaModel => format!(
+                        "It downloads about {}, once.",
+                        human_bytes(tools::OLLAMA_MODEL_BYTES)
+                    ),
+                    _ => "The package manager will say what it is fetching.".to_string(),
+                },
+            ],
+            "Install",
+            "Cancel",
+            "confirm-install",
+        ),
+        tools::Install::Download { bytes, to, .. } => (
+            headline,
+            vec![
+                tool.why().to_string(),
+                format!(
+                    "This downloads {} to {}.",
+                    human_bytes(*bytes),
+                    elide_path(to)
+                ),
+                "It is fetched once and kept, so this only happens the first time."
+                    .to_string(),
+            ],
+            "Download",
+            "Cancel",
+            "confirm-download-model",
+        ),
+        tools::Install::Guided { why, .. } => (
+            headline,
+            vec![
+                why.clone(),
+                "Nothing is installed by pressing this — it opens a terminal, and the \
+                 command is yours to run or not."
+                    .to_string(),
+            ],
+            "Open Terminal",
+            "Close",
+            "confirm-guided",
+        ),
+        tools::Install::Manual { why, url } => (
+            headline,
+            vec![why.clone(), format!("Instructions are at {url}")],
+            "Open the page",
+            "Close",
+            "confirm-manual",
+        ),
+    }
+}
+
+/// The status an audio row reports on the right of its name.
+fn audio_status(row: &AudioRow, palette: &theme::Palette) -> (String, egui::Color32) {
+    match &row.status {
+        transcribe::Status::Pending => match row.transcribed {
+            true => ("transcribed".to_string(), palette.muted),
+            false => (String::new(), palette.muted),
+        },
+        // The stage matters more than the percentage while converting, and the
+        // percentage only means anything once Whisper is the one running.
+        transcribe::Status::Working(stage) => match stage {
+            transcribe::Stage::Transcribing => (
+                format!("{:.0}%", row.fraction * 100.0),
+                palette.accent,
+            ),
+            other => (other.label().to_string(), palette.accent),
+        },
+        transcribe::Status::Done => ("done".to_string(), palette.ok),
+        transcribe::Status::Skipped => ("skipped".to_string(), palette.muted),
+        transcribe::Status::Failed(e) => (e.clone(), palette.bad),
+    }
+}
+
 /// The status a podcast row reports on the right of its name.
 fn feed_status(feed: &FeedRow, palette: &theme::Palette) -> (String, egui::Color32) {
     match &feed.status {
@@ -1672,10 +2725,30 @@ fn cue_for(totals: &Totals) -> Cue {
 
 impl eframe::App for PodBatchApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        self.paint(ui);
+    }
+}
+
+impl PodBatchApp {
+    /// The whole window, minus the one argument that cannot be built in a test.
+    ///
+    /// Split out from [`eframe::App::ui`] so the tests can paint a real frame:
+    /// `eframe::Frame` has no public constructor, and this function never used
+    /// it. Everything the window draws goes through here.
+    fn paint(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
         self.drain();
+        self.drain_transcribe();
+        self.drain_install();
         self.accept_dropped_files(&ctx);
         self.handle_shortcuts(&ctx);
+
+        // Transcribing reports once per segment, which on a quiet passage can
+        // be several seconds apart; an install reports only when it feels like
+        // it. Both need a steadier clock than that to animate against.
+        if self.transcribing || self.installing.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
 
         // The engine wakes us on every message, but a download reports at most
         // ten times a second and the spinner needs a steadier clock than that.
@@ -1714,6 +2787,39 @@ impl eframe::App for PodBatchApp {
                     .show(ui, |ui| {
                         ui.add_space(6.0);
                         self.feed_pane(ui);
+                    });
+
+                egui::CentralPanel::default().show(ui, |ui| {
+                    ui.add_space(6.0);
+                    self.output_pane(ui);
+                });
+            }
+            // Laid out like the Downloads tab on purpose: the list of things to
+            // be done on the left, what is happening to them on the right. The
+            // two tabs do different work, but they are the same shape of job
+            // and there is nothing to gain by making them look unrelated.
+            Tab::Transcripts => {
+                egui::Panel::top(egui::Id::new("transcripts-bar")).show(ui, |ui| {
+                    ui.add_space(6.0);
+                    self.transcripts_bar(ui);
+                    ui.add_space(6.0);
+                });
+
+                egui::Panel::bottom(egui::Id::new("transcripts-options")).show(ui, |ui| {
+                    ui.add_space(6.0);
+                    self.transcripts_options(ui);
+                    ui.add_space(4.0);
+                    self.transcribe_progress(ui);
+                    ui.add_space(6.0);
+                });
+
+                egui::Panel::left(egui::Id::new("audio"))
+                    .resizable(true)
+                    .default_size(380.0)
+                    .min_size(260.0)
+                    .show(ui, |ui| {
+                        ui.add_space(6.0);
+                        self.audio_pane(ui);
                     });
 
                 egui::CentralPanel::default().show(ui, |ui| {
@@ -2009,14 +3115,17 @@ mod tests {
             Action::Start,
             Action::Stop,
             Action::Show(Tab::Downloads),
+            Action::Show(Tab::Transcripts),
             Action::Show(Tab::Settings),
             Action::SelectAll,
             Action::SelectNone,
+            Action::ChooseAudioFolder,
+            Action::Transcribe,
         ] {
             let count = actions.iter().filter(|&&a| a == expected).count();
             assert_eq!(count, 1, "{expected:?} should have exactly one shortcut");
         }
-        assert_eq!(actions.len(), 7, "an action was added without a test");
+        assert_eq!(actions.len(), 10, "an action was added without a test");
 
         for (action, _, description) in &all {
             assert!(!description.is_empty(), "{action:?} has no description");
@@ -2345,6 +3454,18 @@ mod tests {
         )
     }
 
+    /// The whole window, painted. Two of these are needed before anything can
+    /// be read off it — see the note in [`frame`].
+    fn paint_frame(ctx: &egui::Context, app: &mut PodBatchApp) -> String {
+        let mut output = ctx.run_ui(Default::default(), |ui| app.paint(ui));
+        let mut text = String::new();
+        for clipped in &output.shapes {
+            collect_text(&clipped.shape, &mut text);
+        }
+        output.textures_delta.clear();
+        text
+    }
+
     fn frame_with(ctx: &egui::Context, app: &mut PodBatchApp, input: egui::RawInput) -> String {
         let mut output = ctx.run_ui(input, |_| {
             app.handle_shortcuts(ctx);
@@ -2461,6 +3582,258 @@ mod tests {
         assert_eq!(elide_path(&outside), outside.display().to_string());
     }
 
+    // ---- transcripts ------------------------------------------------------
+
+    /// A machine with everything on it, so a test can choose what to take away.
+    fn all_tools_present() -> Vec<tools::Found> {
+        tools::Tool::all()
+            .iter()
+            .map(|tool| tools::Found {
+                tool: *tool,
+                presence: tools::Presence::Ready("here".into()),
+                path: Some(PathBuf::from("/usr/bin/thing")),
+            })
+            .collect()
+    }
+
+    fn without(tool: tools::Tool) -> Vec<tools::Found> {
+        all_tools_present()
+            .into_iter()
+            .map(|mut f| {
+                if f.tool == tool {
+                    f.presence = tools::Presence::Missing;
+                    f.path = None;
+                }
+                f
+            })
+            .collect()
+    }
+
+    /// A folder with audio in it, and a handle to clean it up.
+    fn folder_of_audio(names: &[&str]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "podbatch-audio-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        for name in names {
+            std::fs::write(dir.join(name), b"x").expect("write");
+        }
+        dir
+    }
+
+    #[test]
+    fn the_transcripts_tab_paints_its_pieces() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let mut app = test_app();
+        app.tab = Tab::Transcripts;
+        app.tools = without(tools::Tool::Whisper);
+
+        paint_frame(&ctx, &mut app);
+        let painted = paint_frame(&ctx, &mut app);
+
+        for expected in ["Transcripts", "Audio files", "What this needs", "Whisper"] {
+            assert!(painted.contains(expected), "{expected:?} missing from {painted}");
+        }
+        // The missing piece offers a way to put it right; the ones that are
+        // there do not.
+        assert!(painted.contains("Install…"), "no install button: {painted}");
+    }
+
+    #[test]
+    fn the_tab_lists_the_audio_in_the_folder_and_ignores_the_rest() {
+        let dir = folder_of_audio(&["one.mp3", "two.m4a", "notes.txt", "art.jpg"]);
+        let mut app = test_app();
+        app.load_audio_folder(dir.clone());
+
+        let listed: Vec<&str> = app.audio.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(listed, vec!["one.mp3", "two.m4a"]);
+        assert!(app.audio.iter().all(|a| a.selected), "new files start ticked");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An episode with a transcript beside it starts unticked, so "transcribe"
+    /// on a folder half done means the half that isn't.
+    #[test]
+    fn an_already_transcribed_episode_starts_unticked() {
+        let dir = folder_of_audio(&["done.mp3", "todo.mp3"]);
+        std::fs::write(dir.join("done.txt"), "a transcript").expect("write");
+
+        let mut app = test_app();
+        app.load_audio_folder(dir.clone());
+
+        let done = app.audio.iter().find(|a| a.name == "done.mp3").expect("done");
+        let todo = app.audio.iter().find(|a| a.name == "todo.mp3").expect("todo");
+        assert!(!done.selected, "an existing transcript should start unticked");
+        assert!(todo.selected);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The whole point of the Ollama step being optional.
+    #[test]
+    fn transcribing_is_possible_without_ollama_but_not_without_whisper() {
+        let mut app = test_app();
+
+        app.tools = without(tools::Tool::Ollama);
+        assert!(app.can_transcribe(), "Ollama is optional");
+        app.tools = without(tools::Tool::OllamaModel);
+        assert!(app.can_transcribe(), "the Ollama model is optional");
+
+        for required in [
+            tools::Tool::Ffmpeg,
+            tools::Tool::Whisper,
+            tools::Tool::WhisperModel,
+        ] {
+            app.tools = without(required);
+            assert!(!app.can_transcribe(), "{required:?} should be required");
+        }
+    }
+
+    /// The user's rule: nothing lands on the machine without being asked about.
+    #[test]
+    fn nothing_is_installed_without_being_asked_first() {
+        let mut app = test_app();
+        app.tools = without(tools::Tool::Whisper);
+
+        let install = tools::Install::Run {
+            program: "brew".into(),
+            args: vec!["install".into(), "whisper-cpp".into()],
+            display: "brew install whisper-cpp".into(),
+        };
+        app.ask(Dialog::Install { tool: tools::Tool::Whisper, install });
+
+        assert!(app.dialog.is_some(), "asking should put a question up");
+        assert!(app.installing.is_none(), "nothing may run before the answer");
+
+        // Said no: still nothing.
+        let dialog = app.dialog.take().expect("a dialog");
+        app.declined(dialog);
+        assert!(app.installing.is_none(), "a refusal must not install anything");
+        assert!(app.install_rx.is_none());
+    }
+
+    /// What is agreed to has to be what is shown, so the command goes in the box
+    /// verbatim rather than being described.
+    #[test]
+    fn the_install_question_shows_the_command_that_will_run() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let mut app = test_app();
+        app.tab = Tab::Transcripts;
+        app.ask(Dialog::Install {
+            tool: tools::Tool::Whisper,
+            install: tools::plan(tools::Tool::Whisper, Some(tools::Manager::Homebrew)),
+        });
+
+        paint_frame(&ctx, &mut app);
+        let painted = paint_frame(&ctx, &mut app);
+        assert!(painted.contains("Install Whisper?"), "{painted}");
+        assert!(painted.contains("brew install whisper-cpp"), "{painted}");
+        assert!(painted.contains("Copy command"), "{painted}");
+    }
+
+    /// A bootstrap that needs a password is never offered as something we run.
+    #[test]
+    fn a_missing_package_manager_offers_a_terminal_rather_than_an_install() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let mut app = test_app();
+        app.tab = Tab::Transcripts;
+        app.ask(Dialog::Install {
+            tool: tools::Tool::PackageManager,
+            install: tools::plan(tools::Tool::PackageManager, None),
+        });
+
+        paint_frame(&ctx, &mut app);
+        let painted = paint_frame(&ctx, &mut app);
+        assert!(painted.contains("Open Terminal"), "{painted}");
+        assert!(
+            !painted.contains("Install\n") && painted.contains("Nothing is installed by pressing"),
+            "{painted}"
+        );
+    }
+
+    /// The two kinds of speaker numbering are not interchangeable, so the box
+    /// that starts a run says which one is about to happen.
+    #[test]
+    fn the_transcribe_question_says_which_kind_of_numbering_it_will_do() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+
+        let mut app = test_app();
+        app.tab = Tab::Transcripts;
+        app.ask(Dialog::Transcribe { files: 3, labelling: true });
+        paint_frame(&ctx, &mut app);
+        let painted = paint_frame(&ctx, &mut app);
+        assert!(painted.contains("Transcribe 3 episodes?"), "{painted}");
+        assert!(painted.contains("same person throughout"), "{painted}");
+
+        let mut app = test_app();
+        app.tab = Tab::Transcripts;
+        app.ask(Dialog::Transcribe { files: 1, labelling: false });
+        paint_frame(&ctx, &mut app);
+        let painted = paint_frame(&ctx, &mut app);
+        assert!(painted.contains("Transcribe 1 episode?"), "{painted}");
+        assert!(painted.contains("several numbers"), "{painted}");
+    }
+
+    /// Starting is guarded the same way the button is: no files, no tools, or a
+    /// run already going all mean the question is never asked.
+    #[test]
+    fn transcribing_cannot_start_from_a_state_the_button_would_refuse() {
+        let dir = folder_of_audio(&["one.mp3"]);
+
+        let mut app = test_app();
+        app.tools = all_tools_present();
+        app.load_audio_folder(dir.clone());
+
+        // Nothing ticked.
+        app.audio.iter_mut().for_each(|a| a.selected = false);
+        app.ask_transcribe();
+        assert!(app.dialog.is_none(), "nothing ticked should ask nothing");
+
+        // Ticked, but the tools are gone.
+        app.audio.iter_mut().for_each(|a| a.selected = true);
+        app.tools = without(tools::Tool::Whisper);
+        app.ask_transcribe();
+        assert!(app.dialog.is_none(), "no Whisper should ask nothing");
+
+        // Ticked, tools present, but already running.
+        app.tools = all_tools_present();
+        app.transcribing = true;
+        app.ask_transcribe();
+        assert!(app.dialog.is_none(), "a second run must not be startable");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Ticking acts on whichever list is in front of the user.
+    #[test]
+    fn select_all_follows_the_tab_it_is_pressed_on() {
+        let dir = folder_of_audio(&["one.mp3"]);
+        let mut app = test_app();
+        app.feeds = vec![feed(false, vec![])];
+        app.load_audio_folder(dir.clone());
+        app.audio.iter_mut().for_each(|a| a.selected = false);
+
+        app.tab = Tab::Transcripts;
+        app.perform(Action::SelectAll);
+        assert!(app.audio[0].selected, "the episodes should have been ticked");
+        assert!(!app.feeds[0].selected, "the podcasts should have been left alone");
+
+        app.tab = Tab::Downloads;
+        app.perform(Action::SelectAll);
+        assert!(app.feeds[0].selected);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// An app with no egui context behind it, for testing the parts that are
     /// state rather than painting.
     fn test_app() -> PodBatchApp {
@@ -2491,6 +3864,17 @@ mod tests {
             downloads_began: None,
             measured_rate: None,
             last_cue: None,
+            audio_dir: None,
+            audio: Vec::new(),
+            tools: Vec::new(),
+            label_speakers: true,
+            skip_transcribed: true,
+            transcribing: false,
+            transcribe_cancel: None,
+            transcribe_rx: None,
+            installing: None,
+            install_rx: None,
+            install_progress: None,
         }
     }
 }
