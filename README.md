@@ -38,23 +38,31 @@ are and what they weigh — and then asks:
 
 > **Download 47 episodes?**
 > 3.2 GB to fetch, plus 4 episodes that don't say how big they are.
-> At around 2.4 MB/s, that is at least 23 minutes.
+> At around 2.4 MB/s on one connection, that is at least 23 minutes — likely quicker, with 4 downloading at once.
 > 12 episodes already downloaded, and will be left alone.
 
 "Download the lot" can mean four minutes or four hours, and the difference
 matters before it starts rather than after. The size is what the feeds declare,
-counting only the episodes that aren't already on disk. The speed is a guess
-taken from how fast the feeds themselves came down, scaled by the number of
-downloads that run at once — a rough figure, which is why the box says "around"
-and, when some episodes declare no size, "at least". Once a run has finished,
-the speed that run actually managed replaces the guess for the next one.
+counting only the episodes that aren't already on disk.
 
-A feed with nothing to say about its sizes gets an honest "there was nothing to
-measure your connection against" instead of a fabricated number. And when
-everything is already downloaded there is no question to ask, so none is asked.
+The speed is measured rather than assumed. Before the box appears, a quarter of
+a megabyte of one episode is fetched and timed — over in a moment on a fast
+line, and cut off after a second and a half on a slow one, so the question
+itself never costs much of the time it is there to save. It cannot be measured
+from the feeds: those arrive gzipped from nearly every host and are inflated
+before anything can count them, which leaves no honest number to divide by.
 
-Answering **Cancel**, or pressing Escape, ends the run there having downloaded
-nothing.
+That measurement is one connection's worth while the run puts several in
+flight, so the time it gives is the slow end of what to expect rather than a
+promise — hence "likely quicker". Once a run has finished, the speed that run
+actually managed replaces it, and being a whole-run figure it needs no such
+allowance. A run that could not be measured at all says so, rather than
+printing a number with nothing behind it. And when everything is already
+downloaded there is no question to ask, so none is asked.
+
+Answering **Cancel**, or pressing Escape, ends the run there. Nothing has been
+written: not an episode, not a `.part` file, not so much as a folder — reading
+the feeds is all that has happened, and it happens entirely in memory.
 
 Stopping asks too. Escape during a run — like the **Stop** button, which asks
 the same question — puts up a box rather than abandoning the run on a keypress

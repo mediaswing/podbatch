@@ -144,6 +144,27 @@ enum Dialog {
     Stop,
 }
 
+/// A speed to estimate from, and where it came from — which decides how the
+/// estimate built on it can honestly be worded.
+#[derive(Clone, Copy)]
+enum Speed {
+    /// One connection, timed on a slice of a real episode before the run. The
+    /// run puts several transfers in flight at once, so a time worked out from
+    /// this is a ceiling: the answer should come out quicker, not slower.
+    Probed(f64),
+    /// What a whole run actually managed, start to finish. This already counts
+    /// everything that was running at once, so it needs no such allowance.
+    Measured(f64),
+}
+
+impl Speed {
+    fn rate(self) -> f64 {
+        match self {
+            Self::Probed(rate) | Self::Measured(rate) => rate,
+        }
+    }
+}
+
 /// How much a cue matters, when a batch of updates has earned more than one.
 ///
 /// The end of a run outranks anything inside it: that is the cue someone who
@@ -259,6 +280,8 @@ pub struct PodBatchApp {
 
     /// The question on screen, if there is one.
     dialog: Option<Dialog>,
+    /// A plan that arrived while another question was up, waiting its turn.
+    pending_plan: Option<Plan>,
     /// Set the moment a dialog opens, so its safe answer can be given the
     /// keyboard focus on that frame and left alone on every frame after — a
     /// dialog that grabs focus back every frame cannot be tabbed away from.
@@ -303,6 +326,7 @@ impl PodBatchApp {
             rx: None,
             notify,
             dialog: None,
+            pending_plan: None,
             focus_dialog: false,
             downloads_began: None,
             measured_rate: None,
@@ -558,6 +582,21 @@ impl PodBatchApp {
         self.focus_dialog = true;
     }
 
+    /// Put the plan up as a question, or hold it if something else is being
+    /// asked first.
+    ///
+    /// Stopping is reachable while the feeds are still being read, so the plan
+    /// can arrive with "Stop downloading?" already on screen. Replacing it
+    /// there would swap the buttons under a press already on its way to one of
+    /// them — and the swap is from "Stop" to "Download", so an attempt to
+    /// abort would start the whole run instead.
+    fn put_plan(&mut self, plan: Plan) {
+        match self.dialog {
+            Some(_) => self.pending_plan = Some(plan),
+            None => self.ask(Dialog::Confirm(plan)),
+        }
+    }
+
     /// The user said yes.
     fn agreed(&mut self, dialog: Dialog) {
         match dialog {
@@ -567,7 +606,12 @@ impl PodBatchApp {
                 }
                 self.downloads_began = Some(Instant::now());
             }
-            Dialog::Stop => self.stop(),
+            Dialog::Stop => {
+                // Nothing left to confirm: the run they were asked about is the
+                // one they just stopped.
+                self.pending_plan = None;
+                self.stop();
+            }
         }
     }
 
@@ -576,7 +620,13 @@ impl PodBatchApp {
     fn declined(&mut self, dialog: Dialog) {
         match dialog {
             Dialog::Confirm(_) => self.stop(),
-            Dialog::Stop => {}
+            // Carrying on: if the plan arrived while this was up, it is now
+            // the question that needs asking.
+            Dialog::Stop => {
+                if let Some(plan) = self.pending_plan.take() {
+                    self.ask(Dialog::Confirm(plan));
+                }
+            }
         }
     }
 
@@ -589,12 +639,23 @@ impl PodBatchApp {
             return;
         };
 
-        let (headline, lines, yes, no) = match &dialog {
+        // A modal per kind of question. Sharing one id would hand a press
+        // registered on the box that was up to whichever box replaced it, since
+        // egui tracks a widget by where it sits and what order it was added in
+        // — and both of these have a button in the same place.
+        let (headline, lines, yes, no, id) = match &dialog {
             Dialog::Confirm(plan) => (
                 plan_headline(plan),
-                plan_lines(plan, self.measured_rate.or(plan.sampled_rate)),
+                plan_lines(
+                    plan,
+                    self.measured_rate
+                        .map(Speed::Measured)
+                        .or(plan.probed_rate.map(Speed::Probed)),
+                    self.concurrency,
+                ),
                 "▶ Download",
                 "Cancel",
+                "confirm-download",
             ),
             Dialog::Stop => (
                 "Stop downloading?".to_string(),
@@ -607,11 +668,16 @@ impl PodBatchApp {
                 ],
                 "■ Stop",
                 "Keep downloading",
+                "confirm-stop",
             ),
         };
 
+        // True only on the frame the box appears, which is also the frame a
+        // keypress from before it existed would still be sitting in the queue.
+        let first_frame = self.focus_dialog;
+
         let mut answer = None;
-        egui::Modal::new(egui::Id::new("question")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::new(id)).show(ctx, |ui| {
             ui.set_max_width(460.0);
             ui.label(RichText::new(headline).strong().size(18.0));
             ui.add_space(8.0);
@@ -646,8 +712,13 @@ impl PodBatchApp {
             });
         });
 
-        // Escape dismisses, which is the same as saying no.
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+        // Escape dismisses, which is the same as saying no — but not on the
+        // frame the box went up. A plan can arrive from the engine in the same
+        // frame as a keypress, and a question answered by a key pressed before
+        // it was asked is not a question at all: it would flash by unread and
+        // cancel the run on a press that was meant for whatever came before.
+        if !first_frame && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
             answer = Some(false);
         }
 
@@ -781,7 +852,7 @@ impl PodBatchApp {
                         }
                     } else {
                         self.say(OutputKind::Plain, plan_headline(&plan));
-                        self.ask(Dialog::Confirm(plan));
+                        self.put_plan(plan);
                     }
                 }
                 Update::Finished { cancelled } => {
@@ -795,7 +866,7 @@ impl PodBatchApp {
                     if !cancelled {
                         want(CUE_RUN_ENDED, cue_for(&self.totals()));
                     }
-                    self.note_rate();
+                    self.note_rate(cancelled);
                     self.running = false;
                     self.cancelling = false;
                     self.cancel = None;
@@ -805,6 +876,7 @@ impl PodBatchApp {
                     // ask; a window closed under a modal that outlived it would
                     // be stuck behind it.
                     self.dialog = None;
+                    self.pending_plan = None;
                 }
             }
         }
@@ -834,10 +906,20 @@ impl PodBatchApp {
     /// Only worth keeping from a run long enough and large enough to have
     /// measured anything: a couple of small files in a couple of seconds says
     /// more about the server's latency than about the line.
-    fn note_rate(&mut self) {
+    ///
+    /// And only from a run that finished. The bytes counted here are the ones
+    /// that landed complete, while the clock covers everything that was in
+    /// flight — so a run stopped with four large episodes most of the way down
+    /// looks like a slow line when it was nothing of the sort, and the next
+    /// estimate would inherit that.
+    fn note_rate(&mut self, cancelled: bool) {
         let Some(began) = self.downloads_began.take() else {
             return;
         };
+        if cancelled {
+            return;
+        }
+
         let seconds = began.elapsed().as_secs_f64();
         let bytes = self.totals().bytes;
         if seconds >= 2.0 && bytes >= 4 * 1024 * 1024 {
@@ -1362,10 +1444,10 @@ fn plan_headline(plan: &Plan) -> String {
 /// — can tell which. So it says how much, how fast the line looks, and how long
 /// that comes to, and it says which of those it is unsure about: an estimate
 /// that hides its own footing is worse than none.
-fn plan_lines(plan: &Plan, rate: Option<f64>) -> Vec<String> {
+fn plan_lines(plan: &Plan, speed: Option<Speed>, concurrency: usize) -> Vec<String> {
     let mut lines = Vec::new();
 
-    let sized = plan.episodes - plan.unsized_episodes;
+    let sized = plan.episodes.saturating_sub(plan.unsized_episodes);
     match (sized, plan.unsized_episodes) {
         (0, _) => lines.push(
             "None of them says how big it is, so there is no telling how much there is to \
@@ -1380,13 +1462,38 @@ fn plan_lines(plan: &Plan, rate: Option<f64>) -> Vec<String> {
         )),
     }
 
-    match rate.and_then(|rate| transfer_seconds(plan.bytes, rate).map(|s| (rate, s))) {
-        Some((rate, seconds)) if plan.bytes > 0 => lines.push(format!(
-            "At around {}, that is {}{}.",
-            human_rate(rate),
-            if plan.unsized_episodes > 0 { "at least " } else { "about " },
-            human_duration(seconds)
-        )),
+    match speed.and_then(|speed| transfer_seconds(plan.bytes, speed.rate()).map(|s| (speed, s))) {
+        Some((speed, seconds)) if plan.bytes > 0 => {
+            // "less than a minute" is already a bound and takes no "about" in
+            // front of it; a figure in minutes takes one, and takes "at least"
+            // instead when episodes are missing from the sum it was made from.
+            let estimate = human_duration(seconds);
+            let sentence = match (seconds < 60.0, plan.unsized_episodes > 0) {
+                (true, false) => format!("that is {estimate}"),
+                (true, true) => format!("that is {estimate} for the ones that say"),
+                (false, false) => format!("that is about {estimate}"),
+                (false, true) => format!("that is at least {estimate}"),
+            };
+
+            // A probe is one connection's worth. Several run at once, so the
+            // figure it gives is the slow end of what to expect, and saying so
+            // is the difference between an estimate and a promise.
+            let per = match speed {
+                Speed::Probed(_) if concurrency > 1 => " on one connection",
+                _ => "",
+            };
+            let allowance = match speed {
+                Speed::Probed(_) if concurrency > 1 => {
+                    format!(" — likely quicker, with {concurrency} downloading at once")
+                }
+                _ => String::new(),
+            };
+
+            lines.push(format!(
+                "At around {}{per}, {sentence}{allowance}.",
+                human_rate(speed.rate())
+            ));
+        }
         // Either nothing measurable came back from reading the feeds, or there
         // is no declared size to divide by. Saying so is the honest answer.
         _ => lines.push(
@@ -1873,15 +1980,22 @@ mod tests {
             bytes: 40 * 1024 * 1024,
             unsized_episodes: 0,
             skipped: 12,
-            sampled_rate: Some(1024.0 * 1024.0),
+            probed_rate: Some(1024.0 * 1024.0),
         };
 
         assert_eq!(plan_headline(&plan), "Download 40 episodes?");
-        let lines = plan_lines(&plan, plan.sampled_rate).join("\n");
+        let lines = plan_lines(&plan, Some(Speed::Measured(1024.0 * 1024.0)), 4).join("\n");
         assert!(lines.contains("40.0 MB to fetch"), "{lines}");
         assert!(lines.contains("1.0 MB/s"), "{lines}");
-        assert!(lines.contains("about 40 seconds") || lines.contains("less than a minute"), "{lines}");
+        // 40 MB at 1 MB/s is 40 seconds, which is worded as its own bound —
+        // "about less than a minute" is what a lazier join produces here.
+        assert!(lines.contains("that is less than a minute."), "{lines}");
         assert!(lines.contains("12 episodes already downloaded"), "{lines}");
+
+        // The same plan over a slower line, where the figure is a real one and
+        // does take a hedge in front of it.
+        let slow = plan_lines(&plan, Some(Speed::Measured(64.0 * 1024.0)), 4).join("\n");
+        assert!(slow.contains("that is about 11 minutes."), "{slow}");
     }
 
     /// An estimate with nothing behind it is worse than no estimate: it is the
@@ -1893,17 +2007,17 @@ mod tests {
             bytes: 0,
             unsized_episodes: 3,
             skipped: 0,
-            sampled_rate: None,
+            probed_rate: None,
         };
 
-        let lines = plan_lines(&plan, None).join("\n");
+        let lines = plan_lines(&plan, None, 4).join("\n");
         assert!(lines.contains("None of them says how big it is"), "{lines}");
         assert!(lines.contains("anyone's guess"), "{lines}");
         assert!(!lines.contains("already downloaded"), "{lines}");
 
         // A known size with no rate still declines to put a time on it.
         let sized = Plan { bytes: 5_000_000, unsized_episodes: 0, ..plan };
-        let lines = plan_lines(&sized, None).join("\n");
+        let lines = plan_lines(&sized, None, 4).join("\n");
         assert!(lines.contains("4.8 MB to fetch"), "{lines}");
         assert!(lines.contains("anyone's guess"), "{lines}");
     }
@@ -1917,10 +2031,10 @@ mod tests {
             bytes: 10 * 1024 * 1024,
             unsized_episodes: 4,
             skipped: 0,
-            sampled_rate: Some(1024.0),
+            probed_rate: Some(1024.0),
         };
 
-        let lines = plan_lines(&plan, plan.sampled_rate).join("\n");
+        let lines = plan_lines(&plan, plan.probed_rate.map(Speed::Probed), 1).join("\n");
         assert!(lines.contains("4 episodes that don't say how big they are"), "{lines}");
         assert!(lines.contains("at least"), "{lines}");
     }
@@ -1948,7 +2062,7 @@ mod tests {
             bytes: 40 * 1024 * 1024,
             unsized_episodes: 0,
             skipped: 0,
-            sampled_rate: Some(1024.0 * 1024.0),
+            probed_rate: Some(1024.0 * 1024.0),
         }));
 
         // Two frames, in the order the real window runs them: fonts and the
@@ -1963,23 +2077,9 @@ mod tests {
         assert!(painted.contains("40.0 MB to fetch"), "{painted}");
         assert!(painted.contains("1.0 MB/s"), "{painted}");
 
-        // Frame two: Escape, which the dialog must take before the shortcut
-        // table can read it as "stop the run".
-        let input = egui::RawInput {
-            events: vec![egui::Event::Key {
-                key: egui::Key::Escape,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers: egui::Modifiers::NONE,
-            }],
-            ..Default::default()
-        };
-        let mut output = ctx.run_ui(input, |_| {
-            app.handle_shortcuts(&ctx);
-            app.dialogs(&ctx);
-        });
-        output.textures_delta.clear();
+        // Then Escape, which the dialog must take before the shortcut table can
+        // read it as "stop the run".
+        escaping(&ctx, &mut app);
 
         assert!(app.dialog.is_none(), "Escape should have dismissed the box");
         assert!(
@@ -1988,10 +2088,112 @@ mod tests {
         );
     }
 
+    /// A key pressed before a question existed must not answer it.
+    ///
+    /// The plan arrives from the engine, in `drain`, part way through a frame —
+    /// so a box can go up in the same frame as a keypress aimed at whatever was
+    /// on screen a moment earlier. Answered by that press, the confirmation
+    /// would appear and be gone inside one frame, cancelling a run the user
+    /// never saw themselves being asked about.
+    #[test]
+    fn a_question_cannot_be_answered_by_a_key_pressed_before_it_was_asked() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+
+        let mut app = test_app();
+        app.running = true;
+        app.cancel = Some(Cancel::new());
+        app.proceed = Some(Proceed::new());
+        frame(&ctx, &mut app);
+
+        // The engine's plan lands in the same frame the key is pressed.
+        app.put_plan(Plan { episodes: 5, bytes: 500, ..Plan::default() });
+        escaping(&ctx, &mut app);
+        assert!(
+            app.dialog.is_some(),
+            "the box was answered by a press that predates it"
+        );
+        assert!(!app.cancelling, "and the run was cancelled by it");
+
+        // Escape from here on does answer it, because now it has been seen.
+        escaping(&ctx, &mut app);
+        assert!(app.dialog.is_none());
+        assert!(app.cancelling);
+    }
+
+    /// A question already on screen must not be swapped for another one.
+    ///
+    /// Stopping is reachable while the feeds are still being read, so "Stop
+    /// downloading?" can be up when the plan arrives. Both boxes put a button
+    /// in the same place, so replacing one with the other hands a press meant
+    /// for "■ Stop" to "▶ Download" — the click that was trying to abort the
+    /// run would start the whole thing instead.
+    #[test]
+    fn a_plan_arriving_mid_question_waits_its_turn() {
+        let mut app = test_app();
+        app.running = true;
+        app.cancel = Some(Cancel::new());
+        app.proceed = Some(Proceed::new());
+        app.ask(Dialog::Stop);
+
+        app.put_plan(Plan { episodes: 5, ..Plan::default() });
+        assert!(
+            matches!(app.dialog, Some(Dialog::Stop)),
+            "the question on screen was swapped underneath the user"
+        );
+        assert!(app.pending_plan.is_some());
+
+        // Carrying on brings the plan up as the next question.
+        let dialog = app.dialog.take().expect("dialog");
+        app.declined(dialog);
+        assert!(matches!(app.dialog, Some(Dialog::Confirm(_))));
+        assert!(app.pending_plan.is_none());
+    }
+
+    /// And stopping at that question drops the plan rather than asking about a
+    /// run that no longer exists.
+    #[test]
+    fn stopping_discards_a_plan_that_was_waiting_behind_the_question() {
+        let mut app = test_app();
+        app.running = true;
+        app.cancel = Some(Cancel::new());
+        app.proceed = Some(Proceed::new());
+        app.ask(Dialog::Stop);
+        app.put_plan(Plan { episodes: 5, ..Plan::default() });
+
+        let dialog = app.dialog.take().expect("dialog");
+        app.agreed(dialog);
+        assert!(app.cancelling);
+        assert!(app.pending_plan.is_none(), "asked about a run that was stopped");
+        assert!(app.dialog.is_none());
+    }
+
     /// Run one frame the way the window does, and hand back every scrap of text
     /// that was actually painted.
     fn frame(ctx: &egui::Context, app: &mut PodBatchApp) -> String {
-        let mut output = ctx.run_ui(Default::default(), |_| {
+        frame_with(ctx, app, Default::default())
+    }
+
+    /// One frame with Escape pressed in it.
+    fn escaping(ctx: &egui::Context, app: &mut PodBatchApp) -> String {
+        frame_with(
+            ctx,
+            app,
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+        )
+    }
+
+    fn frame_with(ctx: &egui::Context, app: &mut PodBatchApp, input: egui::RawInput) -> String {
+        let mut output = ctx.run_ui(input, |_| {
             app.handle_shortcuts(ctx);
             app.dialogs(ctx);
         });
@@ -2063,6 +2265,7 @@ mod tests {
             rx: None,
             notify: Arc::new(|| {}),
             dialog: None,
+            pending_plan: None,
             focus_dialog: false,
             downloads_began: None,
             measured_rate: None,

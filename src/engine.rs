@@ -32,6 +32,14 @@ const ATTEMPTS: u32 = 3;
 /// How often a running download reports progress upward.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(120);
 
+/// How much of one episode to pull down to see how fast the line is, and how
+/// long to spend doing it. Whichever comes first: on a fast line this is a
+/// quarter of a megabyte and over in a moment, and on a slow one it is a
+/// second and a half of waiting and no more — the confirmation box is meant to
+/// save the user time, so it cannot cost much of it to appear.
+const PROBE_BYTES: u64 = 256 * 1024;
+const PROBE_TIME: Duration = Duration::from_millis(1500);
+
 #[derive(Debug, Clone)]
 pub struct Settings {
     /// The podcasts the user ticked. Parsing the OPML is the window's job, so
@@ -84,10 +92,11 @@ pub struct Plan {
     pub unsized_episodes: usize,
     /// Episodes already on disk, which are not part of the job.
     pub skipped: usize,
-    /// Bytes per second one connection managed while the feeds were read, if
-    /// the fetches gave anything worth measuring. A rough gauge of the line,
-    /// and the only one available before a single episode has been fetched.
-    pub sampled_rate: Option<f64>,
+    /// Bytes per second **one** connection managed on a slice of a real
+    /// episode, if the probe got anything worth measuring. Several downloads
+    /// run at once, so the whole run should manage more than this rather than
+    /// less — see [`probe_rate`].
+    pub probed_rate: Option<f64>,
 }
 
 /// Messages from the engine to the UI. Feeds and episodes are addressed by
@@ -314,8 +323,22 @@ async fn run(
         return;
     }
 
-    let plan = summarise(&reads, concurrency);
+    let mut plan = summarise(&reads);
     let outstanding = plan.episodes;
+
+    // Only worth asking the line how fast it is when there is something to
+    // fetch — and only then is anyone going to be shown the answer.
+    if outstanding > 0 && !ctx.cancel.is_cancelled()
+        && let Some(first) = reads
+            .iter()
+            .filter_map(|r| r.plan.as_ref())
+            .flat_map(|p| &p.episodes)
+            .map(|(_, episode, _)| episode)
+            .next()
+    {
+        plan.probed_rate = probe_rate(&ctx, first).await;
+    }
+
     ctx.send(Update::Planned(plan));
 
     // Nothing to fetch is nothing to agree to, so a run that has already got
@@ -375,7 +398,7 @@ fn abandon(ctx: &Ctx, reads: &[FeedRead]) {
 
 /// Add up what the feeds came back with, into the description of the job that
 /// the confirmation box is built from.
-fn summarise(reads: &[FeedRead], concurrency: usize) -> Plan {
+fn summarise(reads: &[FeedRead]) -> Plan {
     let mut plan = Plan::default();
 
     for read in reads {
@@ -389,34 +412,56 @@ fn summarise(reads: &[FeedRead], concurrency: usize) -> Plan {
         }
     }
 
-    let samples: Vec<Sample> = reads.iter().filter_map(|r| r.sample).collect();
-    plan.sampled_rate = rate_from(&samples, concurrency);
     plan
 }
 
-/// The line speed the feed fetches suggest, in bytes per second.
+/// Time a slice of a real episode, to have something to estimate with.
 ///
-/// Each sample is one feed body: the bytes on the wire and how long they took
-/// once the response headers had arrived, so connecting, TLS and the server's
-/// own thinking time are left out — those are per-request costs that say
-/// nothing about how fast a hundred-megabyte episode will come down.
+/// The feeds cannot answer this, though it is tempting to think they can. They
+/// are XML, they arrive gzipped from almost every host, and reqwest inflates
+/// them on the way in — at which point `content_length` is `None` and the bytes
+/// handed back are several times the bytes that crossed the wire. Timing a feed
+/// therefore measures either nothing or a fiction. Media is already compressed
+/// and comes down untouched, so a piece of the very thing that is about to be
+/// downloaded is the one honest measurement available.
 ///
-/// The samples are taken with as many fetches in flight as the downloads will
-/// use, so multiplying by that number turns one connection's share into the
-/// aggregate the run should manage. It is still a guess made from a few hundred
-/// kilobytes of XML, which is why everything built on it is worded as one.
-fn rate_from(samples: &[Sample], concurrency: usize) -> Option<f64> {
-    let (bytes, seconds) = samples
-        .iter()
-        .filter(|s| s.is_usable())
-        .fold((0u64, 0.0f64), |(b, s), sample| {
-            (b + sample.bytes, s + sample.seconds)
-        });
+/// One connection, so this is a floor for what the run will manage rather than
+/// a prediction of it: several downloads run at once. A short read of an
+/// episode that is about to be fetched in full anyway, and it is thrown away —
+/// this leaves nothing behind on disk.
+async fn probe_rate(ctx: &Ctx, episode: &feed::Episode) -> Option<f64> {
+    let _permit = ctx.permits.acquire().await.ok()?;
 
-    (seconds > 0.0 && bytes > 0).then(|| (bytes as f64 / seconds) * concurrency as f64)
+    let resp = ctx
+        .client
+        .get(&episode.url)
+        .header(reqwest::header::RANGE, format!("bytes=0-{}", PROBE_BYTES - 1))
+        .timeout(Duration::from_secs(20))
+        .send()
+        .await
+        .ok()?;
+    let resp = resp.error_for_status().ok()?;
+    // No length means the body was decoded on the way in, so what is counted
+    // below is not what crossed the wire. Better no estimate than a wrong one.
+    resp.content_length()?;
+
+    let started = Instant::now();
+    let mut bytes = 0u64;
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        if ctx.cancel.is_cancelled() {
+            return None;
+        }
+        bytes += chunk.ok()?.len() as u64;
+        if bytes >= PROBE_BYTES || started.elapsed() >= PROBE_TIME {
+            break;
+        }
+    }
+
+    Sample { bytes, seconds: started.elapsed().as_secs_f64() }.rate()
 }
 
-/// One feed's worth of "how fast did that come down".
+/// A stretch of transfer, and what it says about the line.
 #[derive(Debug, Clone, Copy)]
 struct Sample {
     bytes: u64,
@@ -424,14 +469,17 @@ struct Sample {
 }
 
 impl Sample {
-    /// Small or brief transfers measure the clock more than the connection.
-    fn is_usable(&self) -> bool {
-        self.bytes >= 4096 && self.seconds >= 0.005 && self.seconds.is_finite()
+    /// Bytes per second, for a sample big enough and long enough to mean
+    /// anything. A handful of bytes in a fraction of a millisecond measures the
+    /// clock rather than the connection.
+    fn rate(&self) -> Option<f64> {
+        (self.bytes >= 4096 && self.seconds >= 0.005 && self.seconds.is_finite())
+            .then(|| self.bytes as f64 / self.seconds)
     }
 }
 
-/// What reading one feed produced: work to do, work that turned out to be
-/// already done, and how fast the feed itself came down.
+/// What reading one feed produced: work to do, and work that turned out to be
+/// already done.
 #[derive(Default)]
 struct FeedRead {
     /// `None` when there is nothing to download from this podcast — it failed,
@@ -439,7 +487,6 @@ struct FeedRead {
     plan: Option<FeedPlan>,
     /// How many of its episodes were already on disk.
     skipped: usize,
-    sample: Option<Sample>,
 }
 
 /// A feed that has been read, with the episodes it still owes and where each
@@ -464,8 +511,8 @@ async fn plan_feed(
 
     ctx.send(Update::FeedStatus { feed: index, status: FeedStatus::Fetching });
 
-    let (body, sample) = match fetch_feed(&ctx, &sub.url).await {
-        Ok(fetched) => fetched,
+    let body = match fetch_feed(&ctx, &sub.url).await {
+        Ok(body) => body,
         Err(e) => {
             // Stopping is not a failure. A feed abandoned mid-fetch goes back
             // to waiting rather than being reported — and coloured — as broken,
@@ -488,7 +535,7 @@ async fn plan_feed(
             let msg = e.to_string();
             ctx.log(format!("{}: {msg}", sub.title));
             ctx.send(Update::FeedStatus { feed: index, status: FeedStatus::Failed(msg) });
-            return FeedRead { sample, ..FeedRead::default() };
+            return FeedRead::default();
         }
     };
 
@@ -502,16 +549,13 @@ async fn plan_feed(
         ctx.log(format!("{}: no episodes with downloadable media", sub.title));
         ctx.send(Update::FeedStatus { feed: index, status: FeedStatus::Done });
         ctx.send(Update::Episodes { feed: index, episodes: Vec::new() });
-        return FeedRead { sample, ..FeedRead::default() };
+        return FeedRead::default();
     }
 
+    // Worked out but not created: a pass that only reads the feeds must leave
+    // nothing behind, or turning the confirmation down would still litter the
+    // output folder with a folder per podcast. `download_feed` makes it.
     let dir = ctx.settings.out_dir.join(&folder);
-    if let Err(e) = tokio::fs::create_dir_all(&dir).await {
-        let msg = format!("cannot create folder: {e}");
-        ctx.log(format!("{}: {msg}", sub.title));
-        ctx.send(Update::FeedStatus { feed: index, status: FeedStatus::Failed(msg) });
-        return FeedRead { sample, ..FeedRead::default() };
-    }
 
     // Name every file before downloading anything, so concurrent tasks in this
     // feed can't race to the same path.
@@ -569,13 +613,12 @@ async fn plan_feed(
 
     if to_fetch.is_empty() {
         ctx.send(Update::FeedStatus { feed: index, status: FeedStatus::Done });
-        return FeedRead { plan: None, skipped, sample };
+        return FeedRead { plan: None, skipped };
     }
 
     FeedRead {
         plan: Some(FeedPlan { index, episodes: to_fetch }),
         skipped,
-        sample,
     }
 }
 
@@ -583,6 +626,17 @@ async fn plan_feed(
 /// `plan_feed`; this is only the moving of the bytes.
 async fn download_feed(ctx: Arc<Ctx>, plan: FeedPlan) {
     let index = plan.index;
+
+    // The folder the planning pass worked out but deliberately did not create.
+    if let Some(dir) = plan.episodes.first().and_then(|(_, _, path)| path.parent())
+        && let Err(e) = tokio::fs::create_dir_all(dir).await
+    {
+        let msg = format!("cannot create folder: {e}");
+        ctx.log(format!("{}: {msg}", dir.display()));
+        ctx.send(Update::FeedStatus { feed: index, status: FeedStatus::Failed(msg) });
+        return;
+    }
+
     ctx.send(Update::FeedStatus { feed: index, status: FeedStatus::Downloading });
 
     let concurrency = ctx.settings.concurrency.clamp(1, 16);
@@ -633,14 +687,7 @@ async fn already_downloaded(ctx: &Ctx, episode: &feed::Episode, path: &Path) -> 
     None
 }
 
-/// Fetch a feed, and time its body while we are there.
-///
-/// The timing starts once the response headers are in, so connecting, the
-/// handshake and the server's own delay are left out of a measurement that is
-/// meant to say how fast bytes move. The size comes from `Content-Length`
-/// because that is what crossed the wire — the body itself may have arrived
-/// compressed and been inflated on the way past.
-async fn fetch_feed(ctx: &Ctx, url: &str) -> Result<(String, Option<Sample>), String> {
+async fn fetch_feed(ctx: &Ctx, url: &str) -> Result<String, String> {
     let mut last = String::new();
     for attempt in 1..=ATTEMPTS {
         if ctx.cancel.is_cancelled() {
@@ -657,19 +704,12 @@ async fn fetch_feed(ctx: &Ctx, url: &str) -> Result<(String, Option<Sample>), St
                 .await
                 .map_err(|e| short_err(&e))?;
             let resp = resp.error_for_status().map_err(|e| short_err(&e))?;
-            let wire = resp.content_length();
-            let started = Instant::now();
-            let body = resp.text().await.map_err(|e| short_err(&e))?;
-            let sample = wire.map(|bytes| Sample {
-                bytes,
-                seconds: started.elapsed().as_secs_f64(),
-            });
-            Ok((body, sample))
+            resp.text().await.map_err(|e| short_err(&e))
         }
         .await;
 
         match result {
-            Ok(fetched) => return Ok(fetched),
+            Ok(body) => return Ok(body),
             Err(e) => {
                 last = e;
                 if attempt < ATTEMPTS {
@@ -856,8 +896,13 @@ mod tests {
     }
 
     /// A single-purpose HTTP server, so the download path is exercised over a
-    /// real socket rather than a mock. Serves one feed and two media files, and
+    /// real socket rather than a mock. Serves the feeds and the media files, and
     /// honours `Range` so resuming can be tested too.
+    ///
+    /// Feeds go out gzipped whenever the client says it takes gzip, which
+    /// reqwest always does — because that is what real feed hosts do, and a
+    /// test server that serves plain XML is a test server that cannot see the
+    /// difference between the two.
     ///
     /// Detached: the thread lives until the test binary exits, which is soon.
     fn start_server() -> String {
@@ -884,18 +929,49 @@ mod tests {
 </channel></rss>"#
         );
 
+        // One episode, served slowly enough that timing it means something.
+        let probe_feed = format!(
+            r#"<?xml version="1.0"?>
+<rss version="2.0"><channel><title>Ignored</title>
+  <item>
+    <title>Slow One</title>
+    <enclosure url="{base}/slow.mp3" length="100000" type="audio/mpeg"/>
+  </item>
+</channel></rss>"#
+        );
+
+        // One episode from a host that only serves the real bytes to a range
+        // request — see `/resume.mp3`.
+        let resume_feed = format!(
+            r#"<?xml version="1.0"?>
+<rss version="2.0"><channel><title>Ignored</title>
+  <item>
+    <title>Episode One</title>
+    <pubDate>Tue, 05 Aug 2025 10:00:00 GMT</pubDate>
+    <enclosure url="{base}/resume.mp3" length="100000" type="audio/mpeg"/>
+  </item>
+</channel></rss>"#
+        );
+
+        let feeds: Vec<(String, String)> = vec![
+            ("/feed.xml".to_string(), feed.clone()),
+            ("/slow.xml".to_string(), feed),
+            ("/probe.xml".to_string(), probe_feed),
+            ("/resume.xml".to_string(), resume_feed),
+        ];
+
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { continue };
-                let feed = feed.clone();
-                std::thread::spawn(move || handle(stream, &feed));
+                let feeds = feeds.clone();
+                std::thread::spawn(move || handle(stream, &feeds));
             }
         });
 
         base
     }
 
-    fn handle(mut stream: TcpStream, feed: &str) {
+    fn handle(mut stream: TcpStream, feeds: &[(String, String)]) {
         let mut reader = BufReader::new(stream.try_clone().expect("clone"));
 
         let mut request_line = String::new();
@@ -904,15 +980,25 @@ mod tests {
         }
         let path = request_line.split_whitespace().nth(1).unwrap_or("/").to_string();
 
-        // Headers, so we can see a Range request.
+        // Headers, so we can see a Range request and what encodings are taken.
+        //
+        // Matched lowercased, because that is how they arrive: hyper writes
+        // every header name in lower case, so a server looking for `Range:`
+        // finds nothing, quietly serves the whole file, and lets a test that
+        // means to prove resumption prove only that starting over also works.
         let mut range_from = None;
+        let mut takes_gzip = false;
         loop {
             let mut line = String::new();
             if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
                 break;
             }
-            if let Some(value) = line.strip_prefix("Range: bytes=") {
+            let line = line.to_ascii_lowercase();
+            if let Some(value) = line.strip_prefix("range: bytes=") {
                 range_from = value.trim().trim_end_matches('-').parse::<usize>().ok();
+            }
+            if let Some(value) = line.strip_prefix("accept-encoding: ") {
+                takes_gzip = value.contains("gzip");
             }
         }
 
@@ -928,16 +1014,79 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_secs(3));
         }
 
-        match path.as_str() {
-            "/feed.xml" | "/slow.xml" => respond(
-                &mut stream,
+        let serve_feed = |stream: &mut TcpStream, xml: &str| {
+            let (body, encoding) = if takes_gzip {
+                (gzip(xml.as_bytes()), "Content-Encoding: gzip\r\n")
+            } else {
+                (xml.as_bytes().to_vec(), "")
+            };
+            respond(
+                stream,
                 format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\n\
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\n{encoding}\
                      Content-Length: {}\r\nConnection: close\r\n\r\n",
-                    feed.len()
+                    body.len()
                 ),
-                feed.as_bytes(),
-            ),
+                &body,
+            );
+        };
+
+        if let Some((_, xml)) = feeds.iter().find(|(name, _)| name == &path) {
+            serve_feed(&mut stream, xml);
+            return;
+        }
+
+        match path.as_str() {
+            // Only a range request gets the real bytes. A client that starts
+            // over from zero is served rubbish of the right length instead, so
+            // a test asserting the file is correct is asserting that it
+            // resumed — and not merely that downloading it twice also works.
+            "/resume.mp3" => {
+                let body = media();
+                match range_from {
+                    Some(from) if from < body.len() => {
+                        let slice = &body[from..];
+                        respond(
+                            &mut stream,
+                            format!(
+                                "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\n\
+                                 Content-Range: bytes {}-{}/{}\r\nConnection: close\r\n\r\n",
+                                slice.len(),
+                                from,
+                                body.len() - 1,
+                                body.len()
+                            ),
+                            slice,
+                        );
+                    }
+                    _ => respond(
+                        &mut stream,
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\
+                             Accept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        ),
+                        &vec![0u8; body.len()],
+                    ),
+                }
+            }
+            // The same bytes as any other episode, dribbled out in two halves
+            // so that timing the transfer measures something above the noise.
+            "/slow.mp3" => {
+                let body = media();
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\
+                     Accept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let (first, second) = body.split_at(body.len() / 2);
+                let _ = stream.write_all(first);
+                let _ = stream.flush();
+                std::thread::sleep(std::time::Duration::from_millis(40));
+                let _ = stream.write_all(second);
+                let _ = stream.flush();
+            }
             "/one.mp3" | "/two" => {
                 let body = media();
                 match range_from {
@@ -974,6 +1123,47 @@ mod tests {
                 b"",
             ),
         }
+    }
+
+    /// Wrap bytes in a gzip stream, using deflate's "stored" blocks so nothing
+    /// is actually compressed.
+    ///
+    /// A real host would compress; what matters to the code under test is that
+    /// the response arrives `Content-Encoding: gzip` and has to be inflated,
+    /// because that is what makes reqwest drop the length — the trap the speed
+    /// probe exists to sidestep. Stored blocks are valid gzip and need no
+    /// compression crate to produce.
+    fn gzip(data: &[u8]) -> Vec<u8> {
+        // Magic, deflate, no flags, no mtime, no extra flags, unknown OS.
+        let mut out = vec![0x1f, 0x8b, 0x08, 0, 0, 0, 0, 0, 0, 0xff];
+
+        let mut chunks = data.chunks(0xffff).peekable();
+        if chunks.peek().is_none() {
+            out.extend_from_slice(&[0x01, 0, 0, 0xff, 0xff]);
+        }
+        while let Some(chunk) = chunks.next() {
+            let last = chunks.peek().is_none();
+            out.push(u8::from(last)); // BFINAL, with BTYPE 00 for stored
+            let len = chunk.len() as u16;
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&(!len).to_le_bytes());
+            out.extend_from_slice(chunk);
+        }
+
+        out.extend_from_slice(&crc32(data).to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out
+    }
+
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = 0xffff_ffffu32;
+        for &byte in data {
+            crc ^= byte as u32;
+            for _ in 0..8 {
+                crc = if crc & 1 == 1 { (crc >> 1) ^ 0xedb8_8320 } else { crc >> 1 };
+            }
+        }
+        !crc
     }
 
     /// A temp directory that cleans up after itself.
@@ -1069,6 +1259,17 @@ mod tests {
         }
     }
 
+    /// The plan the run stopped to ask about.
+    fn plan_of(updates: &[Update]) -> Plan {
+        updates
+            .iter()
+            .find_map(|u| match u {
+                Update::Planned(plan) => Some(plan.clone()),
+                _ => None,
+            })
+            .expect("every run that reads its feeds reports a plan")
+    }
+
     /// The statuses each episode ended on, keyed by file name.
     fn outcomes(updates: &[Update]) -> Vec<(String, EpisodeStatus)> {
         let mut names: Vec<String> = Vec::new();
@@ -1137,11 +1338,23 @@ mod tests {
         assert_eq!(again[1].1, EpisodeStatus::Skipped);
     }
 
+    /// Resuming, proved rather than assumed.
+    ///
+    /// The episode comes from `/resume.mp3`, which serves the real bytes only
+    /// to a range request and a block of zeros to anyone starting from the
+    /// beginning. So the file being right at the end is the assertion that the
+    /// range request was made and honoured — with a server that simply serves
+    /// the file either way, this test passes just as happily when nothing
+    /// resumes at all.
     #[test]
     fn resumes_a_part_file_instead_of_starting_over() {
         let base = start_server();
         let dir = TempDir::new("resume");
-        let settings = settings_for(&dir.0, &base, true);
+        let mut settings = settings_for(&dir.0, &base, true);
+        settings.subscriptions = vec![opml::Subscription {
+            title: "My Show".into(),
+            url: format!("{base}/resume.xml"),
+        }];
         let show = settings.out_dir.join("My Show");
         std::fs::create_dir_all(&show).expect("create show dir");
 
@@ -1237,24 +1450,98 @@ mod tests {
             Proceed::new(),
         );
 
-        let plan = updates
-            .iter()
-            .find_map(|u| match u {
-                Update::Planned(plan) => Some(plan.clone()),
-                _ => None,
-            })
-            .expect("the feeds were read, so a plan was made");
-        assert_eq!(plan.episodes, 3, "three episodes were waiting to be fetched");
+        assert_eq!(
+            plan_of(&updates).episodes,
+            3,
+            "three episodes were waiting to be fetched"
+        );
 
         assert!(matches!(
             updates.last(),
             Some(Update::Finished { cancelled: true })
         ));
-        // The folder may exist — planning creates it — but nothing landed in it.
-        let files: Vec<_> = std::fs::read_dir(&show)
-            .map(|entries| entries.filter_map(|e| e.ok()).collect())
-            .unwrap_or_default();
-        assert!(files.is_empty(), "downloaded without being asked: {files:?}");
+        // Not so much as a folder: a pass that only reads the feeds has no
+        // business writing anything, or turning the box down would still leave
+        // an empty folder for every podcast that was ticked.
+        assert!(
+            !show.exists(),
+            "planning left {} behind",
+            show.display()
+        );
+    }
+
+    /// The trap itself, pinned so it cannot be forgotten: a feed served gzipped
+    /// — which is to say very nearly every feed — arrives with no length.
+    ///
+    /// reqwest inflates it on the way in and drops `Content-Length` when it
+    /// does, so there is nothing to divide by, and the bytes handed back are
+    /// the inflated ones rather than the ones that crossed the wire. Any
+    /// attempt to time the line by timing a feed dies here, and it dies
+    /// silently: no error, just no estimate.
+    #[test]
+    fn a_gzipped_feed_arrives_with_no_length_to_measure() {
+        let base = start_server();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        runtime.block_on(async {
+            install_crypto_provider();
+            let client = reqwest::Client::builder()
+                .user_agent(USER_AGENT)
+                .build()
+                .expect("client");
+
+            let resp = client
+                .get(format!("{base}/feed.xml"))
+                .send()
+                .await
+                .expect("fetch");
+
+            // reqwest strips `Content-Encoding` along with the length once it
+            // has inflated the body, so the response gives no sign it was ever
+            // compressed. There is nothing here to notice the problem by.
+            assert_eq!(resp.headers().get(reqwest::header::CONTENT_ENCODING), None);
+            assert!(
+                resp.content_length().is_none(),
+                "a decoded body has no length — the whole reason the probe times an episode"
+            );
+
+            // And it really was compressed: the server sends a length, so an
+            // uncompressed response would have kept one.
+            assert!(resp.text().await.expect("body").contains("Episode One"));
+        });
+    }
+
+    /// Where the estimate's speed comes from, and why it cannot come from the
+    /// feeds.
+    ///
+    /// Feeds arrive gzipped from very nearly every host — this server sends
+    /// them that way for exactly this reason — and reqwest inflates them on the
+    /// way in, at which point the response has no length and the bytes handed
+    /// back are several times the bytes that crossed the wire. Timing a feed
+    /// therefore measures nothing, or measures a fiction. A slice of a real
+    /// episode is the one honest measurement, and this is the test that says
+    /// so: it fails, with `probed_rate: None`, against anything that goes back
+    /// to timing the XML.
+    #[test]
+    fn the_line_is_measured_on_an_episode_rather_than_the_feed() {
+        let base = start_server();
+        let dir = TempDir::new("probe");
+        let mut settings = settings_for(&dir.0, &base, true);
+        settings.subscriptions = vec![opml::Subscription {
+            title: "Slow Show".into(),
+            url: format!("{base}/probe.xml"),
+        }];
+
+        let plan = plan_of(&run_engine(settings));
+        assert_eq!(plan.episodes, 1);
+
+        let rate = plan
+            .probed_rate
+            .expect("the probe should have timed the episode");
+        assert!(rate.is_finite() && rate > 0.0, "nonsense rate: {rate}");
     }
 
     /// What the confirmation box is built from. The size has to be the size of
@@ -1266,18 +1553,7 @@ mod tests {
         let dir = TempDir::new("plan");
         let settings = settings_for(&dir.0, &base, true);
 
-        let first = run_engine(settings.clone());
-        let plan = |updates: &[Update]| {
-            updates
-                .iter()
-                .find_map(|u| match u {
-                    Update::Planned(plan) => Some(plan.clone()),
-                    _ => None,
-                })
-                .expect("a plan")
-        };
-
-        let before = plan(&first);
+        let before = plan_of(&run_engine(settings.clone()));
         assert_eq!(before.episodes, 3);
         assert_eq!(before.skipped, 0);
         // One episode declares a length; the other two don't, and the 404 is
@@ -1286,25 +1562,20 @@ mod tests {
         assert_eq!(before.unsized_episodes, 2);
 
         // Everything that could be fetched now has been.
-        let after = plan(&run_engine(settings));
+        let after = plan_of(&run_engine(settings));
         assert_eq!(after.skipped, 2);
         assert_eq!(after.episodes, 1, "only the 404 is still outstanding");
         assert_eq!(after.bytes, 0);
     }
 
-    /// A rate is only worth quoting if something was actually measured, and the
-    /// samples too small to mean anything have to be thrown away rather than
-    /// averaged in.
+    /// A rate is only worth quoting if something was actually measured. A
+    /// sample too small or too brief is timing the clock, not the line.
     #[test]
-    fn a_rate_needs_samples_worth_measuring() {
-        let tiny = Sample { bytes: 200, seconds: 0.5 };
-        let instant = Sample { bytes: 500_000, seconds: 0.0 };
-        assert_eq!(rate_from(&[], 4), None);
-        assert_eq!(rate_from(&[tiny, instant], 4), None);
-
-        // 1 MB in a second, on each of four connections.
-        let real = Sample { bytes: 1_048_576, seconds: 1.0 };
-        assert_eq!(rate_from(&[real], 4), Some(4_194_304.0));
+    fn a_rate_needs_a_sample_worth_measuring() {
+        assert_eq!(Sample { bytes: 200, seconds: 0.5 }.rate(), None);
+        assert_eq!(Sample { bytes: 500_000, seconds: 0.0 }.rate(), None);
+        assert_eq!(Sample { bytes: 500_000, seconds: f64::NAN }.rate(), None);
+        assert_eq!(Sample { bytes: 1_048_576, seconds: 1.0 }.rate(), Some(1_048_576.0));
     }
 
     #[test]
