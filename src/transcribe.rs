@@ -444,9 +444,18 @@ fn parse_timestamp(stamp: &str) -> Option<f64> {
 
 /// Gather segments into turns, splitting where Whisper heard the speaker change.
 ///
-/// Numbered in order at this stage — turn one is Speaker 1, turn two is Speaker
-/// 2 — which is as much as the model can honestly support. Making those numbers
-/// mean a *person* is [`Labeller`]'s job, and only happens if Ollama is there.
+/// Turns alternate between Speaker 1 and Speaker 2. All a turn mark tells us is
+/// that the voice changed, so the only thing it forces is that this turn is not
+/// the previous one — and with two voices, "not the previous one" has exactly
+/// one answer. That makes alternating correct for the two-hander, which is most
+/// podcasts, and it is why the numbering stops at two: with three voices "not
+/// the previous one" has two answers and nothing here can choose between them.
+/// Guessing a third would be inventing information.
+///
+/// An earlier version numbered every turn in sequence, which was defensible and
+/// useless: an hour of conversation came out claiming 285 different people. If
+/// there really are three or more, that is what [`Labeller`] is for — it reads
+/// the words and can tell speakers apart in a way a turn mark cannot.
 fn into_turns(segments: Vec<Segment>) -> Vec<Turn> {
     let mut turns: Vec<Turn> = Vec::new();
     let mut current: Option<Turn> = None;
@@ -462,7 +471,7 @@ fn into_turns(segments: Vec<Segment>) -> Vec<Turn> {
                     current = Some(Turn {
                         start: segment.start,
                         text: segment.text.clone(),
-                        speaker: turns.len() + 1,
+                        speaker: turns.len() % 2 + 1,
                     })
                 }
             }
@@ -690,8 +699,9 @@ fn write_transcript(
         "Speakers followed through the episode by Ollama — a number should mean the same \
          person throughout. Check anything that matters.\n"
     } else {
-        "Speakers are numbered per turn: the number changes whenever the voice changes, so \
-         the same person will have several numbers.\n"
+        "Speakers alternate between two voices. Whisper heard where the voice changed but \
+         not whose it is, so this is right for two people talking and wrong for three or \
+         more — and one missed change swaps the two names from that point on.\n"
     });
     out.push('\n');
 
@@ -796,12 +806,33 @@ mod tests {
         assert_eq!(turns[0].text, "Welcome back. Good to see you.");
         assert_eq!(turns[1].text, "Glad to be here.");
         assert_eq!(turns[2].text, "Let's get into it.");
-        // Numbered per turn until Ollama says otherwise — including the third
-        // turn, which is the first speaker again but cannot be known to be.
+        // Alternating, not counting up: the third turn is the first speaker
+        // again, which for two voices is the only thing a turn mark can mean.
         assert_eq!(
             turns.iter().map(|t| t.speaker).collect::<Vec<_>>(),
-            vec![1, 2, 3]
+            vec![1, 2, 1]
         );
+    }
+
+    /// The bug this replaced: an hour of two people talking came out claiming
+    /// 285 of them, because every turn took the next number up.
+    #[test]
+    fn a_long_conversation_has_two_speakers_not_hundreds() {
+        let segments: Vec<Segment> = (0..300)
+            .map(|i| seg(i as f64, "Something said.", true))
+            .collect();
+        let turns = into_turns(segments);
+
+        assert_eq!(turns.len(), 300, "every turn should survive");
+        let mut speakers: Vec<usize> = turns.iter().map(|t| t.speaker).collect();
+        speakers.sort_unstable();
+        speakers.dedup();
+        assert_eq!(speakers, vec![1, 2], "only two voices can be inferred");
+
+        // And they alternate rather than clumping.
+        assert_eq!(turns[0].speaker, 1);
+        assert_eq!(turns[1].speaker, 2);
+        assert_eq!(turns[2].speaker, 1);
     }
 
     #[test]
@@ -956,7 +987,10 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("temp dir");
         let turns = vec![Turn { start: 1.0, text: "Hello.".into(), speaker: 1 }];
 
-        for (labelled, expected) in [(true, "same person throughout"), (false, "per turn")] {
+        for (labelled, expected) in [
+            (true, "same person throughout"),
+            (false, "alternate between two voices"),
+        ] {
             let out = dir.join("ep.txt");
             write_transcript(&out, Path::new("ep.mp3"), &turns, labelled).expect("write");
             let written = std::fs::read_to_string(&out).expect("read");

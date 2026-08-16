@@ -35,9 +35,11 @@ password.
 Speakers are marked "Speaker 1", "Speaker 2" and so on. Two things are worth
 knowing about those numbers:
 
-- Whisper hears **that** the voice changed, never **whose** it is. On its own it
-  therefore starts a new number at every turn, so one person ends up with
-  several numbers over an episode.
+- Whisper hears **that** the voice changed, never **whose** it is. On its own the
+  transcript therefore alternates between Speaker 1 and Speaker 2 — which is the
+  only thing a turn mark forces, and is right for two people talking. Three or
+  more, and it has no way to tell them apart. One missed change also swaps the
+  two names from that point on.
 - Ollama, if you have it, can read the turns afterwards and work out which are
   the same person, so a number stays attached to somebody. This is optional and
   off the critical path: without it you still get a full transcript, just with

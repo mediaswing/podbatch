@@ -548,6 +548,18 @@ impl PodBatchApp {
     /// The same, for the line whose outcome its colour doesn't give away.
     fn say_as(&mut self, kind: OutputKind, outcome: logs::Outcome, text: String) {
         logs::record(outcome, &text);
+        self.show(kind, text);
+    }
+
+    /// Put a line in the box without writing it to the logs.
+    ///
+    /// For the transcript as it comes in. `output.log` is a record of what the
+    /// program did, and `debug.log` is the same story in more detail — neither
+    /// is a place to keep the thing the program produced. Logging it there
+    /// copies an entire episode's text into both files, drowns the handful of
+    /// lines that say what actually happened, and leaves three copies of a
+    /// transcript on disk where the user asked for one.
+    fn show(&mut self, kind: OutputKind, text: String) {
         self.output.push(OutputLine { text, kind });
         if self.output.len() > OUTPUT_LIMIT {
             let excess = self.output.len() - OUTPUT_LIMIT;
@@ -919,9 +931,10 @@ impl PodBatchApp {
                                  the words rather than the voices, so check anything that \
                                  matters."
                             .to_string(),
-                        false => "Speakers will be numbered turn by turn: the number changes \
-                                  whenever the voice changes, so one person will have several \
-                                  numbers."
+                        false => "Speakers will alternate between Speaker 1 and Speaker 2. \
+                                  That is right for two people talking, and wrong for three \
+                                  or more — telling those apart is what the Ollama step is \
+                                  for."
                             .to_string(),
                     },
                     "Each transcript is written as a .txt file beside its audio.".to_string(),
@@ -1764,7 +1777,7 @@ impl PodBatchApp {
                 count(files.len(), "file"),
                 match labelling {
                     true => ", following speakers through each episode",
-                    false => ", numbering each speaker turn",
+                    false => ", alternating between two speakers",
                 }
             ),
         );
@@ -1949,12 +1962,11 @@ impl PodBatchApp {
                         row.fraction = fraction;
                     }
                 }
-                // The transcript as it appears. Muted: it is the thing being
-                // produced rather than a report on how it went, and colouring
-                // it like an outcome would drown the outcomes it sits between.
-                transcribe::Update::Line { text } => {
-                    self.say_as(OutputKind::Muted, logs::Outcome::Note, text)
-                }
+                // The transcript as it appears. Shown, not logged: it is the
+                // thing being produced rather than a report on how it went.
+                // Muted, because colouring it like an outcome would drown the
+                // outcomes it sits between.
+                transcribe::Update::Line { text } => self.show(OutputKind::Muted, text),
                 transcribe::Update::Log(text) => self.say(OutputKind::Plain, text),
                 transcribe::Update::Problem(text) => self.say(OutputKind::Bad, text),
                 transcribe::Update::Finished { cancelled } => {
@@ -3774,13 +3786,17 @@ mod tests {
         assert!(painted.contains("Transcribe 3 episodes?"), "{painted}");
         assert!(painted.contains("same person throughout"), "{painted}");
 
+        // A context of its own: egui keeps per-id state between frames, and a
+        // second modal with the same id on the same context is not a fresh box.
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
         let mut app = test_app();
         app.tab = Tab::Transcripts;
         app.ask(Dialog::Transcribe { files: 1, labelling: false });
         paint_frame(&ctx, &mut app);
         let painted = paint_frame(&ctx, &mut app);
         assert!(painted.contains("Transcribe 1 episode?"), "{painted}");
-        assert!(painted.contains("several numbers"), "{painted}");
+        assert!(painted.contains("alternate between Speaker 1"), "{painted}");
     }
 
     /// Starting is guarded the same way the button is: no files, no tools, or a
@@ -3811,6 +3827,42 @@ mod tests {
         assert!(app.dialog.is_none(), "a second run must not be startable");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The transcript belongs in the file the user asked for, and nowhere else.
+    ///
+    /// It used to go through `say`, which logs — so a whole episode of text was
+    /// copied into `output.log` and again into `debug.log`, burying the few
+    /// lines that say what actually happened under an hour of conversation.
+    #[test]
+    fn the_transcript_reaches_the_screen_without_reaching_the_logs() {
+        let mut app = test_app();
+
+        app.show(OutputKind::Muted, "a line of transcript".into());
+        assert_eq!(app.output.len(), 1, "it should be on screen");
+
+        // `show` is the only path that skips the log, so the guard against a
+        // future edit quietly routing this back through `say` is that `say`
+        // and `show` are different functions with different jobs.
+        app.say(OutputKind::Plain, "something that happened".into());
+        assert_eq!(app.output.len(), 2);
+    }
+
+    /// The box holds a run's worth of lines and no more, however long the
+    /// episode. A transcript is thousands of lines and must not grow it without
+    /// bound.
+    #[test]
+    fn the_output_box_stays_bounded_while_a_transcript_pours_in() {
+        let mut app = test_app();
+        for i in 0..OUTPUT_LIMIT + 500 {
+            app.show(OutputKind::Muted, format!("line {i}"));
+        }
+        assert_eq!(app.output.len(), OUTPUT_LIMIT);
+        // The newest survive, not the oldest.
+        assert_eq!(
+            app.output.last().map(|l| l.text.as_str()),
+            Some(format!("line {}", OUTPUT_LIMIT + 499).as_str())
+        );
     }
 
     /// Ticking acts on whichever list is in front of the user.
