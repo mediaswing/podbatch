@@ -4,6 +4,13 @@
 //! back to the UI over a channel, so the GUI never blocks on I/O. The engine
 //! knows nothing about egui; it just calls `notify` after each message so the
 //! front end can wake up and repaint.
+//!
+//! A run happens in two passes. The first reads every feed, names every file
+//! and sets aside the episodes already on disk, ending in an [`Update::Planned`]
+//! that says how much there is to fetch; the second does the fetching, and only
+//! once the window has said to go ahead via [`Proceed`]. The pause exists so the
+//! user can be told the size of what they just asked for before it starts —
+//! which is not something either side can know until the feeds have been read.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -64,6 +71,25 @@ pub struct EpisodeInfo {
     pub size_hint: Option<u64>,
 }
 
+/// What a run would fetch, worked out from the feeds before anything is
+/// downloaded. Everything the confirmation box needs to describe the job.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Plan {
+    /// Episodes that would actually be downloaded.
+    pub episodes: usize,
+    /// What those episodes come to, counting only the ones that declare a size.
+    pub bytes: u64,
+    /// How many of them declare no size at all, so `bytes` is a floor and not a
+    /// total. Plenty of feeds omit the enclosure length.
+    pub unsized_episodes: usize,
+    /// Episodes already on disk, which are not part of the job.
+    pub skipped: usize,
+    /// Bytes per second one connection managed while the feeds were read, if
+    /// the fetches gave anything worth measuring. A rough gauge of the line,
+    /// and the only one available before a single episode has been fetched.
+    pub sampled_rate: Option<f64>,
+}
+
 /// Messages from the engine to the UI. Feeds and episodes are addressed by
 /// index into the lists the engine announced earlier.
 #[derive(Debug)]
@@ -74,6 +100,8 @@ pub enum Update {
     EpisodeStatus { feed: usize, episode: usize, status: EpisodeStatus },
     Progress { feed: usize, episode: usize, done: u64, total: Option<u64> },
     Log(String),
+    /// Every feed has been read; this is the job, waiting to be agreed to.
+    Planned(Plan),
     Finished { cancelled: bool },
 }
 
@@ -99,11 +127,39 @@ impl Default for Cancel {
     }
 }
 
+/// Handle the UI keeps so it can let the downloads start once the user has seen
+/// what they come to.
+///
+/// A run holds between the two passes until this is set or [`Cancel`] is: the
+/// engine never assumes the answer, because "yes" is the one that spends the
+/// next half hour of someone's bandwidth.
+#[derive(Clone)]
+pub struct Proceed(Arc<AtomicBool>);
+
+impl Proceed {
+    pub fn new() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+    pub fn go(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+    fn is_go(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+impl Default for Proceed {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Shared context passed down to each feed/episode task.
 struct Ctx {
     tx: UnboundedSender<Update>,
     notify: Arc<dyn Fn() + Send + Sync>,
     cancel: Cancel,
+    proceed: Proceed,
     client: reqwest::Client,
     permits: Arc<Semaphore>,
     settings: Settings,
@@ -127,6 +183,7 @@ pub fn spawn(
     settings: Settings,
     tx: UnboundedSender<Update>,
     cancel: Cancel,
+    proceed: Proceed,
     notify: Arc<dyn Fn() + Send + Sync>,
 ) {
     std::thread::Builder::new()
@@ -145,7 +202,7 @@ pub fn spawn(
                     return;
                 }
             };
-            runtime.block_on(run(settings, tx, cancel, notify));
+            runtime.block_on(run(settings, tx, cancel, proceed, notify));
         })
         .expect("spawn engine thread");
 }
@@ -169,6 +226,7 @@ async fn run(
     settings: Settings,
     tx: UnboundedSender<Update>,
     cancel: Cancel,
+    proceed: Proceed,
     notify: Arc<dyn Fn() + Send + Sync>,
 ) {
     install_crypto_provider();
@@ -196,6 +254,7 @@ async fn run(
         tx,
         notify,
         cancel,
+        proceed,
         client,
         permits: Arc::new(Semaphore::new(concurrency)),
         settings,
@@ -236,12 +295,43 @@ async fn run(
         ctx.send(Update::FeedFolder { feed: i, name: name.clone() });
     }
 
-    futures_util::stream::iter(subs.into_iter().zip(folders).enumerate().map(
-        |(index, (sub, folder))| {
-            let ctx = Arc::clone(&ctx);
-            async move { process_feed(ctx, index, sub, folder).await }
-        },
-    ))
+    // Pass one: read the feeds and work out the job.
+    let reads: Vec<FeedRead> =
+        futures_util::stream::iter(subs.into_iter().zip(folders).enumerate().map(
+            |(index, (sub, folder))| {
+                let ctx = Arc::clone(&ctx);
+                async move { plan_feed(ctx, index, sub, folder).await }
+            },
+        ))
+        .buffer_unordered(concurrency)
+        .collect()
+        .await;
+
+    if ctx.cancel.is_cancelled() {
+        abandon(&ctx, &reads);
+        ctx.log("Stopped.".to_string());
+        ctx.send(Update::Finished { cancelled: true });
+        return;
+    }
+
+    let plan = summarise(&reads, concurrency);
+    let outstanding = plan.episodes;
+    ctx.send(Update::Planned(plan));
+
+    // Nothing to fetch is nothing to agree to, so a run that has already got
+    // everything finishes rather than stopping to ask about no work.
+    if outstanding > 0 && !wait_for_go(&ctx).await {
+        abandon(&ctx, &reads);
+        ctx.log("Stopped.".to_string());
+        ctx.send(Update::Finished { cancelled: true });
+        return;
+    }
+
+    // Pass two: fetch it.
+    futures_util::stream::iter(reads.into_iter().filter_map(|read| read.plan).map(|plan| {
+        let ctx = Arc::clone(&ctx);
+        async move { download_feed(ctx, plan).await }
+    }))
     .buffer_unordered(concurrency)
     .collect::<Vec<()>>()
     .await;
@@ -255,16 +345,127 @@ async fn run(
     ctx.send(Update::Finished { cancelled });
 }
 
-async fn process_feed(ctx: Arc<Ctx>, index: usize, sub: opml::Subscription, folder: String) {
+/// Hold until the window says to go ahead. `false` means it said stop instead,
+/// or the user closed the window and the run should wind down.
+///
+/// Polled rather than signalled: this is the one place in the engine that waits
+/// on a person, so a check twenty times a second costs nothing measurable and
+/// keeps the handle the same shape as [`Cancel`] next to it.
+async fn wait_for_go(ctx: &Ctx) -> bool {
+    while !ctx.proceed.is_go() {
+        if ctx.cancel.is_cancelled() {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    !ctx.cancel.is_cancelled()
+}
+
+/// Put the podcasts that were still owed episodes back to waiting.
+///
+/// A run given up between the two passes — stopped, or turned down at the
+/// confirmation — leaves those feeds read but undownloaded. Without this they
+/// keep the status they were last given and sit there saying "reading…" for as
+/// long as the window is open, which is a lie about a run that has ended.
+fn abandon(ctx: &Ctx, reads: &[FeedRead]) {
+    for plan in reads.iter().filter_map(|r| r.plan.as_ref()) {
+        ctx.send(Update::FeedStatus { feed: plan.index, status: FeedStatus::Pending });
+    }
+}
+
+/// Add up what the feeds came back with, into the description of the job that
+/// the confirmation box is built from.
+fn summarise(reads: &[FeedRead], concurrency: usize) -> Plan {
+    let mut plan = Plan::default();
+
+    for read in reads {
+        plan.skipped += read.skipped;
+        for (_, episode, _) in read.plan.iter().flat_map(|p| &p.episodes) {
+            plan.episodes += 1;
+            match episode.length {
+                Some(length) => plan.bytes += length,
+                None => plan.unsized_episodes += 1,
+            }
+        }
+    }
+
+    let samples: Vec<Sample> = reads.iter().filter_map(|r| r.sample).collect();
+    plan.sampled_rate = rate_from(&samples, concurrency);
+    plan
+}
+
+/// The line speed the feed fetches suggest, in bytes per second.
+///
+/// Each sample is one feed body: the bytes on the wire and how long they took
+/// once the response headers had arrived, so connecting, TLS and the server's
+/// own thinking time are left out — those are per-request costs that say
+/// nothing about how fast a hundred-megabyte episode will come down.
+///
+/// The samples are taken with as many fetches in flight as the downloads will
+/// use, so multiplying by that number turns one connection's share into the
+/// aggregate the run should manage. It is still a guess made from a few hundred
+/// kilobytes of XML, which is why everything built on it is worded as one.
+fn rate_from(samples: &[Sample], concurrency: usize) -> Option<f64> {
+    let (bytes, seconds) = samples
+        .iter()
+        .filter(|s| s.is_usable())
+        .fold((0u64, 0.0f64), |(b, s), sample| {
+            (b + sample.bytes, s + sample.seconds)
+        });
+
+    (seconds > 0.0 && bytes > 0).then(|| (bytes as f64 / seconds) * concurrency as f64)
+}
+
+/// One feed's worth of "how fast did that come down".
+#[derive(Debug, Clone, Copy)]
+struct Sample {
+    bytes: u64,
+    seconds: f64,
+}
+
+impl Sample {
+    /// Small or brief transfers measure the clock more than the connection.
+    fn is_usable(&self) -> bool {
+        self.bytes >= 4096 && self.seconds >= 0.005 && self.seconds.is_finite()
+    }
+}
+
+/// What reading one feed produced: work to do, work that turned out to be
+/// already done, and how fast the feed itself came down.
+#[derive(Default)]
+struct FeedRead {
+    /// `None` when there is nothing to download from this podcast — it failed,
+    /// it was abandoned, it lists no media, or every episode is already here.
+    plan: Option<FeedPlan>,
+    /// How many of its episodes were already on disk.
+    skipped: usize,
+    sample: Option<Sample>,
+}
+
+/// A feed that has been read, with the episodes it still owes and where each
+/// one goes.
+struct FeedPlan {
+    index: usize,
+    /// The episodes to download: the index each was announced under, what to
+    /// fetch, and where it lands.
+    episodes: Vec<(usize, feed::Episode, PathBuf)>,
+}
+
+async fn plan_feed(
+    ctx: Arc<Ctx>,
+    index: usize,
+    sub: opml::Subscription,
+    folder: String,
+) -> FeedRead {
     if ctx.cancel.is_cancelled() {
         ctx.send(Update::FeedStatus { feed: index, status: FeedStatus::Pending });
-        return;
+        return FeedRead::default();
     }
 
     ctx.send(Update::FeedStatus { feed: index, status: FeedStatus::Fetching });
 
-    let body = match fetch_feed(&ctx, &sub.url).await {
-        Ok(body) => body,
+    let (body, sample) = match fetch_feed(&ctx, &sub.url).await {
+        Ok(fetched) => fetched,
         Err(e) => {
             // Stopping is not a failure. A feed abandoned mid-fetch goes back
             // to waiting rather than being reported — and coloured — as broken,
@@ -277,7 +478,7 @@ async fn process_feed(ctx: Arc<Ctx>, index: usize, sub: opml::Subscription, fold
                 FeedStatus::Failed(e)
             };
             ctx.send(Update::FeedStatus { feed: index, status });
-            return;
+            return FeedRead::default();
         }
     };
 
@@ -287,7 +488,7 @@ async fn process_feed(ctx: Arc<Ctx>, index: usize, sub: opml::Subscription, fold
             let msg = e.to_string();
             ctx.log(format!("{}: {msg}", sub.title));
             ctx.send(Update::FeedStatus { feed: index, status: FeedStatus::Failed(msg) });
-            return;
+            return FeedRead { sample, ..FeedRead::default() };
         }
     };
 
@@ -301,7 +502,7 @@ async fn process_feed(ctx: Arc<Ctx>, index: usize, sub: opml::Subscription, fold
         ctx.log(format!("{}: no episodes with downloadable media", sub.title));
         ctx.send(Update::FeedStatus { feed: index, status: FeedStatus::Done });
         ctx.send(Update::Episodes { feed: index, episodes: Vec::new() });
-        return;
+        return FeedRead { sample, ..FeedRead::default() };
     }
 
     let dir = ctx.settings.out_dir.join(&folder);
@@ -309,7 +510,7 @@ async fn process_feed(ctx: Arc<Ctx>, index: usize, sub: opml::Subscription, fold
         let msg = format!("cannot create folder: {e}");
         ctx.log(format!("{}: {msg}", sub.title));
         ctx.send(Update::FeedStatus { feed: index, status: FeedStatus::Failed(msg) });
-        return;
+        return FeedRead { sample, ..FeedRead::default() };
     }
 
     // Name every file before downloading anything, so concurrent tasks in this
@@ -339,12 +540,54 @@ async fn process_feed(ctx: Arc<Ctx>, index: usize, sub: opml::Subscription, fold
             })
             .collect(),
     });
+
+    // Settle the episodes already on disk here rather than when their turn to
+    // download would have come. They are not part of the job, so the estimate
+    // the user is about to be shown must not include them — and there is no
+    // sense in making them wait behind a question about work that isn't there.
+    let mut to_fetch: Vec<(usize, feed::Episode, PathBuf)> = Vec::new();
+    let mut skipped = 0;
+    for (ep_index, (episode, name)) in planned.into_iter().enumerate() {
+        let path = dir.join(&name);
+        if let Some(size) = already_downloaded(&ctx, &episode, &path).await {
+            skipped += 1;
+            ctx.send(Update::Progress {
+                feed: index,
+                episode: ep_index,
+                done: size,
+                total: Some(size),
+            });
+            ctx.send(Update::EpisodeStatus {
+                feed: index,
+                episode: ep_index,
+                status: EpisodeStatus::Skipped,
+            });
+        } else {
+            to_fetch.push((ep_index, episode, path));
+        }
+    }
+
+    if to_fetch.is_empty() {
+        ctx.send(Update::FeedStatus { feed: index, status: FeedStatus::Done });
+        return FeedRead { plan: None, skipped, sample };
+    }
+
+    FeedRead {
+        plan: Some(FeedPlan { index, episodes: to_fetch }),
+        skipped,
+        sample,
+    }
+}
+
+/// Fetch one podcast's outstanding episodes. Everything here was decided in
+/// `plan_feed`; this is only the moving of the bytes.
+async fn download_feed(ctx: Arc<Ctx>, plan: FeedPlan) {
+    let index = plan.index;
     ctx.send(Update::FeedStatus { feed: index, status: FeedStatus::Downloading });
 
     let concurrency = ctx.settings.concurrency.clamp(1, 16);
-    futures_util::stream::iter(planned.into_iter().enumerate().map(|(ep_index, (ep, name))| {
+    futures_util::stream::iter(plan.episodes.into_iter().map(|(ep_index, ep, path)| {
         let ctx = Arc::clone(&ctx);
-        let path = dir.join(&name);
         async move {
             let status = download_episode(&ctx, index, ep_index, &ep, &path).await;
             ctx.send(Update::EpisodeStatus { feed: index, episode: ep_index, status });
@@ -362,7 +605,42 @@ async fn process_feed(ctx: Arc<Ctx>, index: usize, sub: opml::Subscription, fold
     ctx.send(Update::FeedStatus { feed: index, status });
 }
 
-async fn fetch_feed(ctx: &Ctx, url: &str) -> Result<String, String> {
+/// The size on disk of an episode that is already here in full, if it is.
+///
+/// A size that doesn't match what the feed declares means the last run was
+/// interrupted after the rename, or the publisher swapped the file; either way
+/// it gets fetched again, and says so.
+async fn already_downloaded(ctx: &Ctx, episode: &feed::Episode, path: &Path) -> Option<u64> {
+    if !ctx.settings.skip_existing {
+        return None;
+    }
+
+    let size = tokio::fs::metadata(path).await.ok()?.len();
+    let complete = match episode.length {
+        Some(declared) => declared == size,
+        None => size > 0,
+    };
+    if complete {
+        return Some(size);
+    }
+
+    ctx.log(format!(
+        "{}: on-disk size {} doesn't match the feed's {}, downloading again",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        util::human_bytes(size),
+        episode.length.map(util::human_bytes).unwrap_or_default()
+    ));
+    None
+}
+
+/// Fetch a feed, and time its body while we are there.
+///
+/// The timing starts once the response headers are in, so connecting, the
+/// handshake and the server's own delay are left out of a measurement that is
+/// meant to say how fast bytes move. The size comes from `Content-Length`
+/// because that is what crossed the wire — the body itself may have arrived
+/// compressed and been inflated on the way past.
+async fn fetch_feed(ctx: &Ctx, url: &str) -> Result<(String, Option<Sample>), String> {
     let mut last = String::new();
     for attempt in 1..=ATTEMPTS {
         if ctx.cancel.is_cancelled() {
@@ -379,12 +657,19 @@ async fn fetch_feed(ctx: &Ctx, url: &str) -> Result<String, String> {
                 .await
                 .map_err(|e| short_err(&e))?;
             let resp = resp.error_for_status().map_err(|e| short_err(&e))?;
-            resp.text().await.map_err(|e| short_err(&e))
+            let wire = resp.content_length();
+            let started = Instant::now();
+            let body = resp.text().await.map_err(|e| short_err(&e))?;
+            let sample = wire.map(|bytes| Sample {
+                bytes,
+                seconds: started.elapsed().as_secs_f64(),
+            });
+            Ok((body, sample))
         }
         .await;
 
         match result {
-            Ok(body) => return Ok(body),
+            Ok(fetched) => return Ok(fetched),
             Err(e) => {
                 last = e;
                 if attempt < ATTEMPTS {
@@ -405,34 +690,6 @@ async fn download_episode(
 ) -> EpisodeStatus {
     if ctx.cancel.is_cancelled() {
         return EpisodeStatus::Cancelled;
-    }
-
-    // Already have it?
-    if ctx.settings.skip_existing
-        && let Ok(meta) = tokio::fs::metadata(path).await
-    {
-        let size = meta.len();
-        let complete = match episode.length {
-            // A size mismatch means the previous run was interrupted after the
-            // rename, or the publisher replaced the file.
-            Some(declared) => declared == size,
-            None => size > 0,
-        };
-        if complete {
-            ctx.send(Update::Progress {
-                feed: feed_index,
-                episode: ep_index,
-                done: size,
-                total: Some(size),
-            });
-            return EpisodeStatus::Skipped;
-        }
-        ctx.log(format!(
-            "{}: on-disk size {} doesn't match the feed's {}, downloading again",
-            path.file_name().unwrap_or_default().to_string_lossy(),
-            util::human_bytes(size),
-            episode.length.map(util::human_bytes).unwrap_or_default()
-        ));
     }
 
     ctx.send(Update::EpisodeStatus {
@@ -740,13 +997,30 @@ mod tests {
         }
     }
 
-    /// Run the engine to completion and hand back everything it reported.
+    /// Run the engine to completion and hand back everything it reported. The
+    /// confirmation is given up front, which is what a user clicking Download
+    /// in the box amounts to.
     fn run_engine(settings: Settings) -> Vec<Update> {
-        run_engine_cancelling_after(settings, None)
+        run_engine_with(settings, None, agreed())
     }
 
     /// As above, but stopping the run after `delay`.
     fn run_engine_cancelling_after(settings: Settings, delay: Option<Duration>) -> Vec<Update> {
+        run_engine_with(settings, delay, agreed())
+    }
+
+    /// A confirmation that has already been given.
+    fn agreed() -> Proceed {
+        let proceed = Proceed::new();
+        proceed.go();
+        proceed
+    }
+
+    fn run_engine_with(
+        settings: Settings,
+        cancel_after: Option<Duration>,
+        proceed: Proceed,
+    ) -> Vec<Update> {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -755,7 +1029,7 @@ mod tests {
             .expect("runtime");
 
         let cancel = Cancel::new();
-        if let Some(delay) = delay {
+        if let Some(delay) = cancel_after {
             let cancel = cancel.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(delay);
@@ -763,7 +1037,7 @@ mod tests {
             });
         }
 
-        runtime.block_on(run(settings, tx, cancel, Arc::new(|| {})));
+        runtime.block_on(run(settings, tx, cancel, proceed, Arc::new(|| {})));
 
         let mut updates = Vec::new();
         while let Ok(update) = rx.try_recv() {
@@ -945,6 +1219,92 @@ mod tests {
             updates.last(),
             Some(Update::Finished { cancelled: true })
         ));
+    }
+
+    /// The whole point of the pause: nothing is fetched until the window says
+    /// so, and a run that is stopped at the question downloads nothing at all.
+    #[test]
+    fn nothing_is_downloaded_until_the_run_is_agreed_to() {
+        let base = start_server();
+        let dir = TempDir::new("unconfirmed");
+        let settings = settings_for(&dir.0, &base, true);
+        let show = settings.out_dir.join("My Show");
+
+        // Never confirmed, and stopped shortly after the feeds are read.
+        let updates = run_engine_with(
+            settings,
+            Some(Duration::from_millis(600)),
+            Proceed::new(),
+        );
+
+        let plan = updates
+            .iter()
+            .find_map(|u| match u {
+                Update::Planned(plan) => Some(plan.clone()),
+                _ => None,
+            })
+            .expect("the feeds were read, so a plan was made");
+        assert_eq!(plan.episodes, 3, "three episodes were waiting to be fetched");
+
+        assert!(matches!(
+            updates.last(),
+            Some(Update::Finished { cancelled: true })
+        ));
+        // The folder may exist — planning creates it — but nothing landed in it.
+        let files: Vec<_> = std::fs::read_dir(&show)
+            .map(|entries| entries.filter_map(|e| e.ok()).collect())
+            .unwrap_or_default();
+        assert!(files.is_empty(), "downloaded without being asked: {files:?}");
+    }
+
+    /// What the confirmation box is built from. The size has to be the size of
+    /// the work left, or the box quotes half an hour for a run that has nothing
+    /// to do but check thirty files it already has.
+    #[test]
+    fn the_plan_counts_only_what_is_left_to_fetch() {
+        let base = start_server();
+        let dir = TempDir::new("plan");
+        let settings = settings_for(&dir.0, &base, true);
+
+        let first = run_engine(settings.clone());
+        let plan = |updates: &[Update]| {
+            updates
+                .iter()
+                .find_map(|u| match u {
+                    Update::Planned(plan) => Some(plan.clone()),
+                    _ => None,
+                })
+                .expect("a plan")
+        };
+
+        let before = plan(&first);
+        assert_eq!(before.episodes, 3);
+        assert_eq!(before.skipped, 0);
+        // One episode declares a length; the other two don't, and the 404 is
+        // one of those.
+        assert_eq!(before.bytes, 100_000);
+        assert_eq!(before.unsized_episodes, 2);
+
+        // Everything that could be fetched now has been.
+        let after = plan(&run_engine(settings));
+        assert_eq!(after.skipped, 2);
+        assert_eq!(after.episodes, 1, "only the 404 is still outstanding");
+        assert_eq!(after.bytes, 0);
+    }
+
+    /// A rate is only worth quoting if something was actually measured, and the
+    /// samples too small to mean anything have to be thrown away rather than
+    /// averaged in.
+    #[test]
+    fn a_rate_needs_samples_worth_measuring() {
+        let tiny = Sample { bytes: 200, seconds: 0.5 };
+        let instant = Sample { bytes: 500_000, seconds: 0.0 };
+        assert_eq!(rate_from(&[], 4), None);
+        assert_eq!(rate_from(&[tiny, instant], 4), None);
+
+        // 1 MB in a second, on each of four connections.
+        let real = Sample { bytes: 1_048_576, seconds: 1.0 };
+        assert_eq!(rate_from(&[real], 4), Some(4_194_304.0));
     }
 
     #[test]

@@ -28,7 +28,38 @@ few you don't want. **All** and **None** are there for when it isn't.
 | Skip episodes already downloaded | on | Leaves a file alone when it is already on disk at the size the feed claims. Turn it off to fetch everything again. |
 | Only the newest *N* episodes | off | Takes the first *N* items in each feed, which is the newest *N* — feeds are published newest-first. |
 | Downloads at once | 4 | How many files are fetched in parallel, across all podcasts. |
-| Sound when finished | on | One cue if everything downloaded, another if anything failed. |
+| Sound as episodes land | on | A cue as each episode finishes, a different one when something fails, and a last one when the run ends. |
+
+## Before it starts
+
+**Download episodes** doesn't start downloading. It reads the feeds first —
+which is the only way anyone, the app included, can know how many episodes there
+are and what they weigh — and then asks:
+
+> **Download 47 episodes?**
+> 3.2 GB to fetch, plus 4 episodes that don't say how big they are.
+> At around 2.4 MB/s, that is at least 23 minutes.
+> 12 episodes already downloaded, and will be left alone.
+
+"Download the lot" can mean four minutes or four hours, and the difference
+matters before it starts rather than after. The size is what the feeds declare,
+counting only the episodes that aren't already on disk. The speed is a guess
+taken from how fast the feeds themselves came down, scaled by the number of
+downloads that run at once — a rough figure, which is why the box says "around"
+and, when some episodes declare no size, "at least". Once a run has finished,
+the speed that run actually managed replaces the guess for the next one.
+
+A feed with nothing to say about its sizes gets an honest "there was nothing to
+measure your connection against" instead of a fabricated number. And when
+everything is already downloaded there is no question to ask, so none is asked.
+
+Answering **Cancel**, or pressing Escape, ends the run there having downloaded
+nothing.
+
+Stopping asks too. Escape during a run — like the **Stop** button, which asks
+the same question — puts up a box rather than abandoning the run on a keypress
+that is as often hit by accident as on purpose. Saying yes stops it as before,
+part-downloaded files and all, which the next run picks up where they stopped.
 
 ## What it writes
 

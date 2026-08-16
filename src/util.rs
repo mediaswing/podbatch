@@ -148,6 +148,53 @@ pub fn human_bytes(bytes: u64) -> String {
     }
 }
 
+/// A length of time written the way someone waiting for it would say it.
+///
+/// Deliberately coarse. This is only ever used for an estimate built on a
+/// guessed connection speed, and "about 23 minutes" claims exactly as much
+/// precision as that guess can support — "23m 41s" would claim far more.
+pub fn human_duration(seconds: f64) -> String {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return "no time at all".to_string();
+    }
+
+    let total = seconds.round() as u64;
+    if total < 60 {
+        return "less than a minute".to_string();
+    }
+
+    let minutes = (total as f64 / 60.0).round().max(1.0) as u64;
+    if minutes < 90 {
+        return format!("{minutes} minute{}", plural(minutes));
+    }
+
+    let hours = minutes / 60;
+    let rest = minutes % 60;
+    if rest == 0 {
+        format!("{hours} hour{}", plural(hours))
+    } else {
+        format!("{hours} hour{} {rest} minute{}", plural(hours), plural(rest))
+    }
+}
+
+fn plural(n: u64) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
+/// Bytes per second as a rate someone can read, e.g. `2.4 MB/s`.
+pub fn human_rate(bytes_per_second: f64) -> String {
+    format!("{}/s", human_bytes(bytes_per_second.max(0.0) as u64))
+}
+
+/// How long `bytes` will take at `bytes_per_second`, in seconds.
+///
+/// `None` when there is no usable rate to divide by, which is the honest answer
+/// rather than a number made up to fill the space.
+pub fn transfer_seconds(bytes: u64, bytes_per_second: f64) -> Option<f64> {
+    (bytes_per_second.is_finite() && bytes_per_second > 0.0)
+        .then(|| bytes as f64 / bytes_per_second)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,5 +241,31 @@ mod tests {
     fn formats_bytes() {
         assert_eq!(human_bytes(512), "512 B");
         assert_eq!(human_bytes(1536), "1.5 KB");
+    }
+
+    #[test]
+    fn formats_durations_coarsely() {
+        assert_eq!(human_duration(0.0), "no time at all");
+        assert_eq!(human_duration(12.0), "less than a minute");
+        assert_eq!(human_duration(61.0), "1 minute");
+        assert_eq!(human_duration(1500.0), "25 minutes");
+        // 90 minutes is where it starts counting in hours.
+        assert_eq!(human_duration(5400.0), "1 hour 30 minutes");
+        assert_eq!(human_duration(7200.0), "2 hours");
+        // A rate of zero produces an infinite estimate upstream; it must not
+        // reach the user as "inf minutes".
+        assert_eq!(human_duration(f64::INFINITY), "no time at all");
+    }
+
+    #[test]
+    fn an_estimate_needs_a_real_rate_to_stand_on() {
+        assert_eq!(transfer_seconds(1_000_000, 1_000_000.0), Some(1.0));
+        assert_eq!(transfer_seconds(1_000_000, 0.0), None);
+        assert_eq!(transfer_seconds(1_000_000, f64::NAN), None);
+    }
+
+    #[test]
+    fn formats_rates() {
+        assert_eq!(human_rate(2.5 * 1024.0 * 1024.0), "2.5 MB/s");
     }
 }

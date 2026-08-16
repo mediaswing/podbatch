@@ -1,9 +1,15 @@
-//! The two end-of-run cues.
+//! The two cues.
 //!
-//! A run can take a long time and finishes without anyone watching, which is
-//! the whole reason for a sound: it says "the downloads are done" to someone
-//! who has gone to do something else, and says which of the two ways it
-//! finished without them having to come back and read a screen.
+//! A run can take a long time and gets on with it without anyone watching,
+//! which is the whole reason for a sound: it says how the run is going to
+//! someone who has gone to do something else, and says it without them having
+//! to come back and read a screen. One plays as each episode lands and the
+//! other when something fails, so a run that is quietly failing sounds
+//! different from one that is quietly working; the last of them says the run
+//! has ended, and which of the two ways it ended.
+//!
+//! Which cue is played when, and how closely two of them may follow each
+//! other, is the window's business — see `app::PodBatchApp::play`.
 //!
 //! Both are CC0 recordings from freesound.org, levelled to the same loudness so
 //! that neither is the startling one — see `assets/sounds/CREDITS.txt`. They are

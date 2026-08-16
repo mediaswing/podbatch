@@ -13,22 +13,35 @@
 //! Everything the engine reports arrives on a channel and is drained once per
 //! frame in [`PodBatchApp::drain`]; nothing in here ever touches the network, so
 //! the window keeps painting no matter how slow a feed is.
+//!
+//! Two things are asked before they are done: starting a run, once the feeds
+//! have been read and the size of the job is known, and stopping one. Both go
+//! through [`Dialog`], and both are asked the same way whether the button or the
+//! keyboard set them off.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use egui::{AtomExt as _, RichText, Ui};
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use crate::engine::{self, Cancel, EpisodeStatus, FeedStatus, Settings, Update};
+use crate::engine::{self, Cancel, EpisodeStatus, FeedStatus, Plan, Proceed, Settings, Update};
 use crate::opml;
 use crate::sound::{self, Cue};
 use crate::theme::{self, CONTROL_HEIGHT, PROGRESS_HEIGHT};
-use crate::util::human_bytes;
+use crate::util::{human_bytes, human_duration, human_rate, transfer_seconds};
 
 /// How many output lines to keep. Long enough to cover a whole run, short enough
 /// that a pathological feed can't grow it without bound.
 const OUTPUT_LIMIT: usize = 2000;
+
+/// The least time between two cues.
+///
+/// Four downloads finish at once often enough, and four overlapping chimes are
+/// noise rather than information; the run says the same thing in writing on the
+/// line above, so a cue that has to be dropped costs nothing.
+const CUE_GAP: Duration = Duration::from_millis(700);
 
 /// The marks down the left of the output.
 ///
@@ -88,7 +101,7 @@ fn shortcuts() -> Vec<(Action, egui::KeyboardShortcut, &'static str)> {
         (
             Action::Stop,
             KeyboardShortcut::new(Modifiers::NONE, Key::Escape),
-            "Stop the run in progress",
+            "Stop the run in progress, after asking",
         ),
         (
             Action::Show(Tab::Downloads),
@@ -118,6 +131,27 @@ enum Outcome {
     Completed,
     Stopped,
 }
+
+/// A question put to the user, over the top of everything else.
+///
+/// Only one can be up at a time: both are about the run as a whole, and the
+/// second cannot arise while the first is unanswered — the keyboard is held
+/// while a dialog is open, and the buttons underneath are behind the modal.
+enum Dialog {
+    /// The feeds have been read; this is what downloading them would cost.
+    Confirm(Plan),
+    /// A run is going and something asked for it to stop.
+    Stop,
+}
+
+/// How much a cue matters, when a batch of updates has earned more than one.
+///
+/// The end of a run outranks anything inside it: that is the cue someone who
+/// walked away is listening for, and it is the one that must not be dropped in
+/// favour of the episode that happened to land just before it.
+const CUE_EPISODE_DONE: u8 = 0;
+const CUE_SOMETHING_FAILED: u8 = 1;
+const CUE_RUN_ENDED: u8 = 2;
 
 struct EpisodeRow {
     title: String,
@@ -217,8 +251,26 @@ pub struct PodBatchApp {
     /// the first run.
     outcome: Option<Outcome>,
     cancel: Option<Cancel>,
+    /// The engine holds between reading the feeds and downloading them; this is
+    /// what releases it, once the user has agreed to the job.
+    proceed: Option<Proceed>,
     rx: Option<UnboundedReceiver<Update>>,
     notify: Arc<dyn Fn() + Send + Sync>,
+
+    /// The question on screen, if there is one.
+    dialog: Option<Dialog>,
+    /// Set the moment a dialog opens, so its safe answer can be given the
+    /// keyboard focus on that frame and left alone on every frame after — a
+    /// dialog that grabs focus back every frame cannot be tabbed away from.
+    focus_dialog: bool,
+
+    /// When the downloads themselves began, and the rate the last run actually
+    /// managed. A rate measured by moving real episodes beats the one guessed
+    /// from reading the feeds, so once there is one it is what the estimate uses.
+    downloads_began: Option<Instant>,
+    measured_rate: Option<f64>,
+    /// When the last cue was played, for [`CUE_GAP`].
+    last_cue: Option<Instant>,
 }
 
 impl PodBatchApp {
@@ -247,8 +299,14 @@ impl PodBatchApp {
             cancelling: false,
             outcome: None,
             cancel: None,
+            proceed: None,
             rx: None,
             notify,
+            dialog: None,
+            focus_dialog: false,
+            downloads_began: None,
+            measured_rate: None,
+            last_cue: None,
         };
 
         if let Some(path) = opml_path {
@@ -388,9 +446,11 @@ impl PodBatchApp {
         self.output_scroll_to = None;
         self.cancelling = false;
         self.outcome = None;
+        self.downloads_began = None;
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let cancel = Cancel::new();
+        let proceed = Proceed::new();
 
         engine::spawn(
             Settings {
@@ -402,11 +462,13 @@ impl PodBatchApp {
             },
             tx,
             cancel.clone(),
+            proceed.clone(),
             Arc::clone(&self.notify),
         );
 
         self.rx = Some(rx);
         self.cancel = Some(cancel);
+        self.proceed = Some(proceed);
         self.running = true;
     }
 
@@ -433,8 +495,8 @@ impl PodBatchApp {
                 }
             }
             Action::Stop => {
-                if self.running && !self.cancelling {
-                    self.stop();
+                if self.running && !self.cancelling && self.dialog.is_none() {
+                    self.ask(Dialog::Stop);
                 }
             }
             Action::Show(tab) => self.tab = tab,
@@ -457,6 +519,13 @@ impl PodBatchApp {
     /// that also wants the key never sees it and the same press cannot be acted
     /// on twice.
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        // An open dialog has the floor. Escape belongs to it — the key that
+        // asked the question must not also answer it — and the rest are actions
+        // on a window the user is currently being asked about.
+        if self.dialog.is_some() {
+            return;
+        }
+
         // A field being typed into wants these keys for itself: in a number
         // field mid-edit, Cmd+A means "select all of this text" and Escape
         // means "cancel the edit", and neither should reach the podcast list.
@@ -482,6 +551,113 @@ impl PodBatchApp {
         }
     }
 
+    // ---- questions --------------------------------------------------------
+
+    fn ask(&mut self, dialog: Dialog) {
+        self.dialog = Some(dialog);
+        self.focus_dialog = true;
+    }
+
+    /// The user said yes.
+    fn agreed(&mut self, dialog: Dialog) {
+        match dialog {
+            Dialog::Confirm(_) => {
+                if let Some(proceed) = &self.proceed {
+                    proceed.go();
+                }
+                self.downloads_began = Some(Instant::now());
+            }
+            Dialog::Stop => self.stop(),
+        }
+    }
+
+    /// The user said no. Declining to start is declining the run, so the engine
+    /// waiting behind the question is let go rather than left holding it.
+    fn declined(&mut self, dialog: Dialog) {
+        match dialog {
+            Dialog::Confirm(_) => self.stop(),
+            Dialog::Stop => {}
+        }
+    }
+
+    /// Draw whichever question is open, and act on the answer.
+    ///
+    /// The dialog is taken out of `self` for the duration so the closure can
+    /// have the whole app, and put back only if it went unanswered.
+    fn dialogs(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = self.dialog.take() else {
+            return;
+        };
+
+        let (headline, lines, yes, no) = match &dialog {
+            Dialog::Confirm(plan) => (
+                plan_headline(plan),
+                plan_lines(plan, self.measured_rate.or(plan.sampled_rate)),
+                "▶ Download",
+                "Cancel",
+            ),
+            Dialog::Stop => (
+                "Stop downloading?".to_string(),
+                vec![
+                    "The episodes part way through will be left where they are."
+                        .to_string(),
+                    "Starting again picks each of them up from the point it stopped, so \
+                     nothing already fetched is fetched twice."
+                        .to_string(),
+                ],
+                "■ Stop",
+                "Keep downloading",
+            ),
+        };
+
+        let mut answer = None;
+        egui::Modal::new(egui::Id::new("question")).show(ctx, |ui| {
+            ui.set_max_width(460.0);
+            ui.label(RichText::new(headline).strong().size(18.0));
+            ui.add_space(8.0);
+            for line in &lines {
+                ui.label(line);
+                ui.add_space(2.0);
+            }
+            ui.add_space(14.0);
+
+            ui.horizontal(|ui| {
+                let confirm = ui.add_sized(
+                    egui::vec2(150.0, CONTROL_HEIGHT),
+                    egui::Button::new(yes),
+                );
+                let cancel = ui.add_sized(
+                    egui::vec2(170.0, CONTROL_HEIGHT),
+                    egui::Button::new(no),
+                );
+
+                // The harmless answer is the one holding focus when the box
+                // appears, so a stray Return does the thing that can be undone.
+                if self.focus_dialog {
+                    cancel.request_focus();
+                    self.focus_dialog = false;
+                }
+                if confirm.clicked() {
+                    answer = Some(true);
+                }
+                if cancel.clicked() {
+                    answer = Some(false);
+                }
+            });
+        });
+
+        // Escape dismisses, which is the same as saying no.
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            answer = Some(false);
+        }
+
+        match answer {
+            Some(true) => self.agreed(dialog),
+            Some(false) => self.declined(dialog),
+            None => self.dialog = Some(dialog),
+        }
+    }
+
     /// Drain everything the engine has said since the last frame.
     fn drain(&mut self) {
         let Some(rx) = self.rx.as_mut() else { return };
@@ -491,6 +667,16 @@ impl PodBatchApp {
             updates.push(update);
         }
 
+        // The loudest thing this batch of updates deserves. Collected rather
+        // than played as it goes, because a batch can hold a dozen finished
+        // episodes and they are worth one sound between them.
+        let mut cue: Option<(u8, Cue)> = None;
+        let mut want = |rank: u8, sound: Cue| {
+            if cue.is_none_or(|(existing, _)| rank >= existing) {
+                cue = Some((rank, sound));
+            }
+        };
+
         for update in updates {
             match update {
                 Update::FeedFolder { feed, name } => {
@@ -499,6 +685,11 @@ impl PodBatchApp {
                     }
                 }
                 Update::FeedStatus { feed, status } => {
+                    // A podcast that could not be read is a failure worth
+                    // hearing about: nothing under it will download at all.
+                    if matches!(status, FeedStatus::Failed(_)) {
+                        want(CUE_SOMETHING_FAILED, Cue::Failure);
+                    }
                     if let Some(row) = self.row_mut(feed) {
                         row.status = status;
                     }
@@ -540,18 +731,24 @@ impl PodBatchApp {
                     let title = ep.title.clone();
                     let size = human_bytes(ep.done);
                     match status {
-                        EpisodeStatus::Done => self.say(
-                            OutputKind::Good,
-                            format!("{MARK_DONE} {show} — {file} ({size})"),
-                        ),
+                        EpisodeStatus::Done => {
+                            want(CUE_EPISODE_DONE, Cue::Success);
+                            self.say(
+                                OutputKind::Good,
+                                format!("{MARK_DONE} {show} — {file} ({size})"),
+                            );
+                        }
                         EpisodeStatus::Skipped => self.say(
                             OutputKind::Muted,
                             format!("{MARK_SKIPPED} {show} — {file} (already downloaded)"),
                         ),
-                        EpisodeStatus::Failed(e) => self.say(
-                            OutputKind::Bad,
-                            format!("{MARK_FAILED} {show} — {title}: {e}"),
-                        ),
+                        EpisodeStatus::Failed(e) => {
+                            want(CUE_SOMETHING_FAILED, Cue::Failure);
+                            self.say(
+                                OutputKind::Bad,
+                                format!("{MARK_FAILED} {show} — {title}: {e}"),
+                            );
+                        }
                         _ => {}
                     }
                 }
@@ -571,6 +768,22 @@ impl PodBatchApp {
                     }
                 }
                 Update::Log(line) => self.say(OutputKind::Plain, line),
+                Update::Planned(plan) => {
+                    if plan.episodes == 0 {
+                        // Nothing to fetch is nothing to ask about, and the
+                        // engine doesn't wait for an answer in that case either.
+                        if plan.skipped > 0 {
+                            self.say(
+                                OutputKind::Muted,
+                                "Every episode is already downloaded — nothing to fetch."
+                                    .into(),
+                            );
+                        }
+                    } else {
+                        self.say(OutputKind::Plain, plan_headline(&plan));
+                        self.ask(Dialog::Confirm(plan));
+                    }
+                }
                 Update::Finished { cancelled } => {
                     self.outcome = Some(if cancelled {
                         Outcome::Stopped
@@ -579,15 +792,56 @@ impl PodBatchApp {
                     });
                     // Stopping was asked for, so it isn't news; the cue is for
                     // the run that ended on its own while nobody was watching.
-                    if self.play_sounds && !cancelled {
-                        sound::play(cue_for(&self.totals()));
+                    if !cancelled {
+                        want(CUE_RUN_ENDED, cue_for(&self.totals()));
                     }
+                    self.note_rate();
                     self.running = false;
                     self.cancelling = false;
                     self.cancel = None;
+                    self.proceed = None;
                     self.rx = None;
+                    // A question about a run that has ended has nothing left to
+                    // ask; a window closed under a modal that outlived it would
+                    // be stuck behind it.
+                    self.dialog = None;
                 }
             }
+        }
+
+        if let Some((rank, sound)) = cue {
+            self.play(rank, sound);
+        }
+    }
+
+    /// Play a cue, unless one was played too recently for a second to be heard
+    /// as anything but noise.
+    fn play(&mut self, rank: u8, cue: Cue) {
+        if !self.play_sounds {
+            return;
+        }
+
+        let now = Instant::now();
+        if cue_is_due(rank, self.last_cue, now) {
+            sound::play(cue);
+            self.last_cue = Some(now);
+        }
+    }
+
+    /// Remember how fast the run that just ended actually went, so the next
+    /// run's estimate rests on a measurement rather than a guess.
+    ///
+    /// Only worth keeping from a run long enough and large enough to have
+    /// measured anything: a couple of small files in a couple of seconds says
+    /// more about the server's latency than about the line.
+    fn note_rate(&mut self) {
+        let Some(began) = self.downloads_began.take() else {
+            return;
+        };
+        let seconds = began.elapsed().as_secs_f64();
+        let bytes = self.totals().bytes;
+        if seconds >= 2.0 && bytes >= 4 * 1024 * 1024 {
+            self.measured_rate = Some(bytes as f64 / seconds);
         }
     }
 
@@ -641,6 +895,11 @@ impl PodBatchApp {
 
     /// The top of the Downloads tab: where the subscription list comes from, and
     /// the button that starts the run.
+    ///
+    /// Choosing the file and starting the run sit together on the first line,
+    /// in the order they are done in. The file's own path goes underneath with
+    /// the whole width to itself, because it is the one thing here whose length
+    /// is not ours to choose.
     fn opml_bar(&mut self, ui: &mut Ui) {
         let busy = self.running;
 
@@ -651,7 +910,7 @@ impl PodBatchApp {
                 .add_enabled(
                     !busy,
                     egui::Button::new("📂 Choose OPML file…")
-                        .min_size(egui::vec2(200.0, CONTROL_HEIGHT)),
+                        .min_size(egui::vec2(190.0, CONTROL_HEIGHT)),
                 )
                 .clicked()
                 && let Some(path) = rfd::FileDialog::new()
@@ -661,39 +920,23 @@ impl PodBatchApp {
                 self.load_opml(path);
             }
 
-            let muted = theme::palette(ui.visuals()).muted;
-            match &self.opml_path {
-                Some(path) => {
-                    let shown = elide_path(path);
-                    ui.add(egui::Label::new(RichText::new(shown).color(muted)).truncate())
-                        .on_hover_text(path.display().to_string());
-                }
-                None => {
-                    ui.label(
-                        RichText::new("None chosen — or drop one onto this window").color(muted),
-                    );
-                }
-            }
-        });
-
-        ui.horizontal(|ui| {
             let ready = self.selected_count() > 0;
             if self.running {
                 let label = if self.cancelling { "Stopping…" } else { "■ Stop" };
                 if ui
                     .add_enabled(
-                        !self.cancelling,
-                        egui::Button::new(label).min_size(egui::vec2(220.0, CONTROL_HEIGHT)),
+                        !self.cancelling && self.dialog.is_none(),
+                        egui::Button::new(label).min_size(egui::vec2(200.0, CONTROL_HEIGHT)),
                     )
                     .clicked()
                 {
-                    self.stop();
+                    self.ask(Dialog::Stop);
                 }
             } else {
                 let response = ui.add_enabled(
                     ready,
                     egui::Button::new("▶ Download episodes")
-                        .min_size(egui::vec2(220.0, CONTROL_HEIGHT)),
+                        .min_size(egui::vec2(200.0, CONTROL_HEIGHT)),
                 );
                 if !ready {
                     response.on_hover_text("Choose an OPML file and tick at least one podcast.");
@@ -712,6 +955,22 @@ impl PodBatchApp {
                     ))
                     .color(muted),
                 );
+            }
+        });
+
+        ui.horizontal(|ui| {
+            let muted = theme::palette(ui.visuals()).muted;
+            match &self.opml_path {
+                Some(path) => {
+                    let shown = elide_path(path);
+                    ui.add(egui::Label::new(RichText::new(shown).color(muted)).truncate())
+                        .on_hover_text(path.display().to_string());
+                }
+                None => {
+                    ui.label(
+                        RichText::new("None chosen — or drop one onto this window").color(muted),
+                    );
+                }
             }
         });
     }
@@ -908,6 +1167,8 @@ impl PodBatchApp {
             // reads like a failure, so a run that hasn't happened says so.
             let headline = if self.feeds.is_empty() || (!self.running && self.outcome.is_none()) {
                 "Ready.".to_string()
+            } else if matches!(self.dialog, Some(Dialog::Confirm(_))) {
+                "Feeds read — waiting for you".to_string()
             } else if self.running && !self.all_listed() {
                 let read = self
                     .running_map
@@ -1024,10 +1285,11 @@ impl PodBatchApp {
             )
             .on_hover_text("How many files to fetch in parallel, across all podcasts.");
         });
-        ui.checkbox(&mut self.play_sounds, "Sound when finished")
+        ui.checkbox(&mut self.play_sounds, "Sound as episodes land")
             .on_hover_text(
-                "Plays a short cue when the run ends — one sound if everything downloaded, \
-                 another if anything failed.",
+                "One cue as each episode finishes downloading and a different one when \
+                 something fails, with a last cue when the whole run ends. Never more than \
+                 one every second or so, however many finish at once.",
             );
 
         ui.add_space(12.0);
@@ -1079,6 +1341,76 @@ fn feed_status(feed: &FeedRow, palette: &theme::Palette) -> (String, egui::Color
     }
 }
 
+/// Whether a cue can be heard as a cue, given when the last one played.
+///
+/// The end of a run is never held back. That is the sound someone who walked
+/// away is listening for, and dropping it because an episode happened to land
+/// a moment earlier would lose the only one that had to be heard.
+fn cue_is_due(rank: u8, last: Option<Instant>, now: Instant) -> bool {
+    rank == CUE_RUN_ENDED || last.is_none_or(|last| now.duration_since(last) >= CUE_GAP)
+}
+
+/// The question at the top of the confirmation box.
+fn plan_headline(plan: &Plan) -> String {
+    format!("Download {}?", count(plan.episodes, "episode"))
+}
+
+/// What the confirmation box says underneath the question.
+///
+/// The point of the box is that "download the lot" can mean four minutes or
+/// four hours, and until the feeds have been read nobody — the user or the app
+/// — can tell which. So it says how much, how fast the line looks, and how long
+/// that comes to, and it says which of those it is unsure about: an estimate
+/// that hides its own footing is worse than none.
+fn plan_lines(plan: &Plan, rate: Option<f64>) -> Vec<String> {
+    let mut lines = Vec::new();
+
+    let sized = plan.episodes - plan.unsized_episodes;
+    match (sized, plan.unsized_episodes) {
+        (0, _) => lines.push(
+            "None of them says how big it is, so there is no telling how much there is to \
+             fetch."
+                .to_string(),
+        ),
+        (_, 0) => lines.push(format!("{} to fetch.", human_bytes(plan.bytes))),
+        (_, unsized_episodes) => lines.push(format!(
+            "{} to fetch, plus {} that don't say how big they are.",
+            human_bytes(plan.bytes),
+            count(unsized_episodes, "episode")
+        )),
+    }
+
+    match rate.and_then(|rate| transfer_seconds(plan.bytes, rate).map(|s| (rate, s))) {
+        Some((rate, seconds)) if plan.bytes > 0 => lines.push(format!(
+            "At around {}, that is {}{}.",
+            human_rate(rate),
+            if plan.unsized_episodes > 0 { "at least " } else { "about " },
+            human_duration(seconds)
+        )),
+        // Either nothing measurable came back from reading the feeds, or there
+        // is no declared size to divide by. Saying so is the honest answer.
+        _ => lines.push(
+            "How long that takes is anyone's guess — there was nothing to measure your \
+             connection against."
+                .to_string(),
+        ),
+    }
+
+    if plan.skipped > 0 {
+        lines.push(format!(
+            "{} already downloaded, and will be left alone.",
+            count(plan.skipped, "episode")
+        ));
+    }
+
+    lines
+}
+
+/// `1 episode`, `4 episodes`.
+fn count(n: usize, noun: &str) -> String {
+    format!("{n} {noun}{}", if n == 1 { "" } else { "s" })
+}
+
 /// Which cue a finished run has earned. Anything that failed makes it a failure,
 /// however much else succeeded — a run that quietly dropped one episode should
 /// not sound like a clean one.
@@ -1099,7 +1431,9 @@ impl eframe::App for PodBatchApp {
 
         // The engine wakes us on every message, but a download reports at most
         // ten times a second and the spinner needs a steadier clock than that.
-        if self.running {
+        // Not while the run is held at the confirmation box: nothing is moving
+        // there, and there is nothing to animate.
+        if self.running && !matches!(self.dialog, Some(Dialog::Confirm(_))) {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
@@ -1147,6 +1481,9 @@ impl eframe::App for PodBatchApp {
                 });
             }
         }
+
+        // Last, so the question is drawn over the window it is about.
+        self.dialogs(&ctx);
     }
 }
 
@@ -1342,6 +1679,11 @@ mod tests {
             "▶ Download episodes",
             "■ Stop",
             "Stopping — letting the transfers in flight wind down…",
+            // The two dialogs, which write the same marks on their buttons.
+            "▶ Download",
+            "Keep downloading",
+            "How long that takes is anyone's guess — there was nothing to measure your \
+             connection against.",
         ];
 
         // Resolved before taking the font lock: reading the style inside the
@@ -1469,6 +1811,226 @@ mod tests {
         assert_eq!(app.selected_count(), 2);
     }
 
+    /// Escape is a key that gets pressed by accident, and it used to throw away
+    /// however much of a run had not finished. Now it asks.
+    #[test]
+    fn stopping_asks_before_it_stops() {
+        let mut app = test_app();
+        app.feeds = vec![feed(true, vec![])];
+        app.running = true;
+        app.cancel = Some(Cancel::new());
+
+        app.perform(Action::Stop);
+        assert!(matches!(app.dialog, Some(Dialog::Stop)));
+        assert!(!app.cancelling, "asking is not stopping");
+
+        // Saying no leaves the run exactly as it was.
+        let dialog = app.dialog.take().expect("dialog");
+        app.declined(dialog);
+        assert!(!app.cancelling);
+        assert!(app.running);
+
+        // Saying yes is what actually stops it.
+        app.perform(Action::Stop);
+        let dialog = app.dialog.take().expect("dialog");
+        app.agreed(dialog);
+        assert!(app.cancelling);
+    }
+
+    /// Turning down the confirmation has to release the engine, which is
+    /// sitting on the question waiting to be told either way. Leaving it there
+    /// would hang the run — and the window — for good.
+    #[test]
+    fn declining_the_confirmation_stops_the_run() {
+        let mut app = test_app();
+        app.running = true;
+        app.cancel = Some(Cancel::new());
+        app.proceed = Some(Proceed::new());
+
+        app.declined(Dialog::Confirm(Plan::default()));
+        assert!(app.cancelling, "the engine was left waiting on an answer");
+    }
+
+    #[test]
+    fn confirming_lets_the_engine_go() {
+        let mut app = test_app();
+        app.running = true;
+        app.proceed = Some(Proceed::new());
+
+        app.agreed(Dialog::Confirm(Plan::default()));
+        assert!(
+            app.downloads_began.is_some(),
+            "the clock the next estimate is built on starts here"
+        );
+    }
+
+    /// What the box actually says. The numbers are the whole reason it exists,
+    /// so each one has to survive the sentence it is put in.
+    #[test]
+    fn the_confirmation_says_how_much_and_how_long() {
+        let plan = Plan {
+            episodes: 40,
+            bytes: 40 * 1024 * 1024,
+            unsized_episodes: 0,
+            skipped: 12,
+            sampled_rate: Some(1024.0 * 1024.0),
+        };
+
+        assert_eq!(plan_headline(&plan), "Download 40 episodes?");
+        let lines = plan_lines(&plan, plan.sampled_rate).join("\n");
+        assert!(lines.contains("40.0 MB to fetch"), "{lines}");
+        assert!(lines.contains("1.0 MB/s"), "{lines}");
+        assert!(lines.contains("about 40 seconds") || lines.contains("less than a minute"), "{lines}");
+        assert!(lines.contains("12 episodes already downloaded"), "{lines}");
+    }
+
+    /// An estimate with nothing behind it is worse than no estimate: it is the
+    /// number the user will plan their evening around.
+    #[test]
+    fn an_unmeasurable_run_says_so_rather_than_guessing() {
+        let plan = Plan {
+            episodes: 3,
+            bytes: 0,
+            unsized_episodes: 3,
+            skipped: 0,
+            sampled_rate: None,
+        };
+
+        let lines = plan_lines(&plan, None).join("\n");
+        assert!(lines.contains("None of them says how big it is"), "{lines}");
+        assert!(lines.contains("anyone's guess"), "{lines}");
+        assert!(!lines.contains("already downloaded"), "{lines}");
+
+        // A known size with no rate still declines to put a time on it.
+        let sized = Plan { bytes: 5_000_000, unsized_episodes: 0, ..plan };
+        let lines = plan_lines(&sized, None).join("\n");
+        assert!(lines.contains("4.8 MB to fetch"), "{lines}");
+        assert!(lines.contains("anyone's guess"), "{lines}");
+    }
+
+    /// Episodes that don't declare a size are not in the byte count, so the
+    /// estimate built from it is a floor and has to be worded as one.
+    #[test]
+    fn an_estimate_missing_some_sizes_is_given_as_a_minimum() {
+        let plan = Plan {
+            episodes: 10,
+            bytes: 10 * 1024 * 1024,
+            unsized_episodes: 4,
+            skipped: 0,
+            sampled_rate: Some(1024.0),
+        };
+
+        let lines = plan_lines(&plan, plan.sampled_rate).join("\n");
+        assert!(lines.contains("4 episodes that don't say how big they are"), "{lines}");
+        assert!(lines.contains("at least"), "{lines}");
+    }
+
+    /// The confirmation drawn for real, in a context with the app's own fonts
+    /// and theme, and answered the way an accidental Escape answers it.
+    ///
+    /// The two frames are the whole interaction: one that puts the box up, one
+    /// that takes the key. Everything either side of it is unit-testable, but
+    /// "does Escape reach the dialog rather than the run underneath it" is not
+    /// a question the state alone can answer — the shortcut table has a claim on
+    /// that key too, and only a real frame decides which of them gets it.
+    #[test]
+    fn the_confirmation_paints_and_escape_answers_it_rather_than_the_run() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+
+        let mut app = test_app();
+        app.feeds = vec![feed(true, vec![])];
+        app.running = true;
+        app.cancel = Some(Cancel::new());
+        app.proceed = Some(Proceed::new());
+        app.ask(Dialog::Confirm(Plan {
+            episodes: 40,
+            bytes: 40 * 1024 * 1024,
+            unsized_episodes: 0,
+            skipped: 0,
+            sampled_rate: Some(1024.0 * 1024.0),
+        }));
+
+        // Two frames, in the order the real window runs them: fonts and the
+        // modal's own size are both settled lazily, so the first frame of any
+        // egui context is a warm-up and paints nothing worth reading.
+        frame(&ctx, &mut app);
+        let painted = frame(&ctx, &mut app);
+        assert!(
+            painted.contains("Download 40 episodes?"),
+            "the question never reached the screen: {painted}"
+        );
+        assert!(painted.contains("40.0 MB to fetch"), "{painted}");
+        assert!(painted.contains("1.0 MB/s"), "{painted}");
+
+        // Frame two: Escape, which the dialog must take before the shortcut
+        // table can read it as "stop the run".
+        let input = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |_| {
+            app.handle_shortcuts(&ctx);
+            app.dialogs(&ctx);
+        });
+        output.textures_delta.clear();
+
+        assert!(app.dialog.is_none(), "Escape should have dismissed the box");
+        assert!(
+            app.cancelling,
+            "declining to start the downloads has to let the waiting engine go"
+        );
+    }
+
+    /// Run one frame the way the window does, and hand back every scrap of text
+    /// that was actually painted.
+    fn frame(ctx: &egui::Context, app: &mut PodBatchApp) -> String {
+        let mut output = ctx.run_ui(Default::default(), |_| {
+            app.handle_shortcuts(ctx);
+            app.dialogs(ctx);
+        });
+        let mut text = String::new();
+        for clipped in &output.shapes {
+            collect_text(&clipped.shape, &mut text);
+        }
+        // Nothing here can hand the texture atlas to a renderer, and dropping
+        // it undelivered panics.
+        output.textures_delta.clear();
+        text
+    }
+
+    fn collect_text(shape: &egui::Shape, out: &mut String) {
+        match shape {
+            egui::Shape::Text(text) => {
+                out.push_str(text.galley.text());
+                out.push('\n');
+            }
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect_text(s, out)),
+            _ => {}
+        }
+    }
+
+    /// A dozen episodes finishing at once is one sound, not a dozen — but the
+    /// cue that says the whole run is over is never the one that gets dropped.
+    #[test]
+    fn cues_are_spaced_out_except_the_one_that_ends_the_run() {
+        let now = Instant::now();
+        let just_now = now - Duration::from_millis(50);
+        let a_while_ago = now - Duration::from_secs(5);
+
+        assert!(cue_is_due(CUE_EPISODE_DONE, None, now), "the first cue always plays");
+        assert!(!cue_is_due(CUE_EPISODE_DONE, Some(just_now), now));
+        assert!(!cue_is_due(CUE_SOMETHING_FAILED, Some(just_now), now));
+        assert!(cue_is_due(CUE_EPISODE_DONE, Some(a_while_ago), now));
+        assert!(cue_is_due(CUE_RUN_ENDED, Some(just_now), now));
+    }
+
     #[test]
     fn elides_the_home_directory() {
         if let Some(home) = dirs::home_dir() {
@@ -1497,8 +2059,14 @@ mod tests {
             cancelling: false,
             outcome: None,
             cancel: None,
+            proceed: None,
             rx: None,
             notify: Arc::new(|| {}),
+            dialog: None,
+            focus_dialog: false,
+            downloads_began: None,
+            measured_rate: None,
+            last_cue: None,
         }
     }
 }
