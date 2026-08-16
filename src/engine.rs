@@ -22,7 +22,9 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc::UnboundedSender, Semaphore};
 
 use crate::feed;
+use crate::logs;
 use crate::opml;
+use crate::tags;
 use crate::util;
 
 const USER_AGENT: &str = concat!("PodBatch/", env!("CARGO_PKG_VERSION"));
@@ -109,6 +111,13 @@ pub enum Update {
     EpisodeStatus { feed: usize, episode: usize, status: EpisodeStatus },
     Progress { feed: usize, episode: usize, done: u64, total: Option<u64> },
     Log(String),
+    /// A line like [`Update::Log`], for something that went wrong.
+    ///
+    /// Kept apart from `Log` so the window can colour it and the output log can
+    /// file it as a failure. Without this, a feed that could not be fetched —
+    /// which loses a whole podcast — goes down in the log looking exactly like
+    /// a line about how many episodes there are.
+    Problem(String),
     /// Every feed has been read; this is the job, waiting to be agreed to.
     Planned(Plan),
     Finished { cancelled: bool },
@@ -185,6 +194,12 @@ impl Ctx {
     fn log(&self, msg: impl Into<String>) {
         self.send(Update::Log(msg.into()));
     }
+
+    /// Something that didn't work, for the window to colour and the output log
+    /// to file as a failure.
+    fn problem(&self, msg: impl Into<String>) {
+        self.send(Update::Problem(msg.into()));
+    }
 }
 
 /// Start a run on a background thread. Returns immediately.
@@ -205,7 +220,7 @@ pub fn spawn(
             {
                 Ok(rt) => rt,
                 Err(e) => {
-                    let _ = tx.send(Update::Log(format!("Could not start the downloader: {e}")));
+                    let _ = tx.send(Update::Problem(format!("Could not start the downloader: {e}")));
                     let _ = tx.send(Update::Finished { cancelled: false });
                     notify();
                     return;
@@ -251,7 +266,7 @@ async fn run(
     let client = match client {
         Ok(c) => c,
         Err(e) => {
-            let _ = tx.send(Update::Log(format!("Could not create HTTP client: {e}")));
+            let _ = tx.send(Update::Problem(format!("Could not create HTTP client: {e}")));
             let _ = tx.send(Update::Finished { cancelled: false });
             notify();
             return;
@@ -284,7 +299,7 @@ async fn run(
     ));
 
     if let Err(e) = tokio::fs::create_dir_all(&ctx.settings.out_dir).await {
-        ctx.log(format!(
+        ctx.problem(format!(
             "Cannot create {}: {e}",
             ctx.settings.out_dir.display()
         ));
@@ -337,7 +352,20 @@ async fn run(
             .next()
     {
         plan.probed_rate = probe_rate(&ctx, first).await;
+        logs::debug(match plan.probed_rate {
+            Some(rate) => format!("probed the line at {}", util::human_rate(rate)),
+            None => "the probe measured nothing usable".to_string(),
+        });
     }
+
+    logs::debug(format!(
+        "planned: {} episode(s) to fetch, {} of declared size, {} declaring none, \
+         {} already here",
+        plan.episodes,
+        util::human_bytes(plan.bytes),
+        plan.unsized_episodes,
+        plan.skipped
+    ));
 
     ctx.send(Update::Planned(plan));
 
@@ -360,6 +388,7 @@ async fn run(
     .await;
 
     let cancelled = ctx.cancel.is_cancelled();
+    logs::debug(format!("run finished, cancelled: {cancelled}"));
     ctx.log(if cancelled {
         "Stopped.".to_string()
     } else {
@@ -493,9 +522,24 @@ struct FeedRead {
 /// one goes.
 struct FeedPlan {
     index: usize,
+    /// Who the episodes belong to, for the tags written into each file.
+    show: Arc<Show>,
     /// The episodes to download: the index each was announced under, what to
     /// fetch, and where it lands.
     episodes: Vec<(usize, feed::Episode, PathBuf)>,
+}
+
+/// The podcast an episode came from, as the tags will record it.
+///
+/// The title is the subscription's, not the feed's own — the same string the
+/// folder is named after, so what a player shows and what the folder says stay
+/// the same thing.
+struct Show {
+    title: String,
+    feed_url: String,
+    /// Whether this podcast has already been mentioned as one whose files can't
+    /// be tagged. Said once, not once per episode.
+    said_untaggable: AtomicBool,
 }
 
 async fn plan_feed(
@@ -511,6 +555,8 @@ async fn plan_feed(
 
     ctx.send(Update::FeedStatus { feed: index, status: FeedStatus::Fetching });
 
+    logs::debug(format!("feed {index} \"{}\": fetching {}", sub.title, sub.url));
+
     let body = match fetch_feed(&ctx, &sub.url).await {
         Ok(body) => body,
         Err(e) => {
@@ -521,7 +567,7 @@ async fn plan_feed(
             let status = if ctx.cancel.is_cancelled() {
                 FeedStatus::Pending
             } else {
-                ctx.log(format!("{}: {e}", sub.title));
+                ctx.problem(format!("{}: {e}", sub.title));
                 FeedStatus::Failed(e)
             };
             ctx.send(Update::FeedStatus { feed: index, status });
@@ -533,7 +579,7 @@ async fn plan_feed(
         Ok(f) => f,
         Err(e) => {
             let msg = e.to_string();
-            ctx.log(format!("{}: {msg}", sub.title));
+            ctx.problem(format!("{}: {msg}", sub.title));
             ctx.send(Update::FeedStatus { feed: index, status: FeedStatus::Failed(msg) });
             return FeedRead::default();
         }
@@ -541,6 +587,12 @@ async fn plan_feed(
 
     // Feeds are conventionally newest-first, so "latest N" is simply the head.
     let mut episodes = parsed.episodes;
+    logs::debug(format!(
+        "feed {index} \"{}\": {} bytes of XML, {} episode(s) with media",
+        sub.title,
+        body.len(),
+        episodes.len()
+    ));
     if let Some(limit) = ctx.settings.limit {
         episodes.truncate(limit);
     }
@@ -559,16 +611,35 @@ async fn plan_feed(
 
     // Name every file before downloading anything, so concurrent tasks in this
     // feed can't race to the same path.
+    //
+    // Two episodes published in the same minute are told apart by the ` (2)`
+    // that `unique_name` adds, which goes to whichever of them the feed lists
+    // second. Should the feed later list them the other way round, the two
+    // names swap — and since both files are on disk at the right size, neither
+    // is fetched again. That costs nothing: both episodes are still here, and
+    // each carries its own title in its own tags, so the only thing that has
+    // moved is which of two same-minute stamps sits on which.
     let mut used: Vec<String> = Vec::new();
     let planned: Vec<(feed::Episode, String)> = episodes
         .into_iter()
         .map(|ep| {
             let ext = util::extension_for(&ep.url, ep.mime.as_deref());
-            let stem = match &ep.date {
-                Some(date) => format!("{date} - {}", util::sanitize(&ep.title)),
+            let stem = match &ep.published {
+                Some(published) => published.stamp(),
+                // A feed that won't say when an episode came out leaves
+                // nothing to stamp it with, and a made-up time would be a claim
+                // about the episode that isn't true — one the next run would
+                // then have to make identically to find the file again. Its
+                // title is the one true thing left to name it by.
                 None => util::sanitize(&ep.title),
             };
             let name = unique_name(&stem, &ext, &mut used);
+            // The names are a timestamp apiece now, so which episode became
+            // which file is a question only the debug log can answer.
+            logs::debug(format!(
+                "feed {index} \"{}\": \"{}\" -> {name}",
+                sub.title, ep.title
+            ));
             (ep, name)
         })
         .collect();
@@ -594,6 +665,11 @@ async fn plan_feed(
     for (ep_index, (episode, name)) in planned.into_iter().enumerate() {
         let path = dir.join(&name);
         if let Some(size) = already_downloaded(&ctx, &episode, &path).await {
+            logs::debug(format!(
+                "{}: already here at {}, not fetching again",
+                path.display(),
+                util::human_bytes(size)
+            ));
             skipped += 1;
             ctx.send(Update::Progress {
                 feed: index,
@@ -611,13 +687,24 @@ async fn plan_feed(
         }
     }
 
+    logs::debug(format!(
+        "feed {index} \"{}\": {} to fetch, {skipped} already here",
+        sub.title,
+        to_fetch.len()
+    ));
+
     if to_fetch.is_empty() {
         ctx.send(Update::FeedStatus { feed: index, status: FeedStatus::Done });
         return FeedRead { plan: None, skipped };
     }
 
+    let show = Arc::new(Show {
+        title: sub.title,
+        feed_url: sub.url,
+        said_untaggable: AtomicBool::new(false),
+    });
     FeedRead {
-        plan: Some(FeedPlan { index, episodes: to_fetch }),
+        plan: Some(FeedPlan { index, show, episodes: to_fetch }),
         skipped,
     }
 }
@@ -632,7 +719,7 @@ async fn download_feed(ctx: Arc<Ctx>, plan: FeedPlan) {
         && let Err(e) = tokio::fs::create_dir_all(dir).await
     {
         let msg = format!("cannot create folder: {e}");
-        ctx.log(format!("{}: {msg}", dir.display()));
+        ctx.problem(format!("{}: {msg}", dir.display()));
         ctx.send(Update::FeedStatus { feed: index, status: FeedStatus::Failed(msg) });
         return;
     }
@@ -640,10 +727,12 @@ async fn download_feed(ctx: Arc<Ctx>, plan: FeedPlan) {
     ctx.send(Update::FeedStatus { feed: index, status: FeedStatus::Downloading });
 
     let concurrency = ctx.settings.concurrency.clamp(1, 16);
+    let show = plan.show;
     futures_util::stream::iter(plan.episodes.into_iter().map(|(ep_index, ep, path)| {
         let ctx = Arc::clone(&ctx);
+        let show = Arc::clone(&show);
         async move {
-            let status = download_episode(&ctx, index, ep_index, &ep, &path).await;
+            let status = download_episode(&ctx, index, ep_index, &show, &ep, &path).await;
             ctx.send(Update::EpisodeStatus { feed: index, episode: ep_index, status });
         }
     }))
@@ -661,9 +750,14 @@ async fn download_feed(ctx: Arc<Ctx>, plan: FeedPlan) {
 
 /// The size on disk of an episode that is already here in full, if it is.
 ///
-/// A size that doesn't match what the feed declares means the last run was
-/// interrupted after the rename, or the publisher swapped the file; either way
-/// it gets fetched again, and says so.
+/// A file shorter than the feed declares means the last run was interrupted
+/// after the rename, or the publisher swapped the file for a shorter one;
+/// either way it gets fetched again, and says so.
+///
+/// Short of it, rather than different from it: the tags written after a
+/// download add bytes the feed's figure knows nothing about, so a complete
+/// episode on disk is always the declared length or a little over. Reading that
+/// as a mismatch would fetch every episode again on every run.
 async fn already_downloaded(ctx: &Ctx, episode: &feed::Episode, path: &Path) -> Option<u64> {
     if !ctx.settings.skip_existing {
         return None;
@@ -671,7 +765,7 @@ async fn already_downloaded(ctx: &Ctx, episode: &feed::Episode, path: &Path) -> 
 
     let size = tokio::fs::metadata(path).await.ok()?.len();
     let complete = match episode.length {
-        Some(declared) => declared == size,
+        Some(declared) => size >= declared,
         None => size > 0,
     };
     if complete {
@@ -679,7 +773,7 @@ async fn already_downloaded(ctx: &Ctx, episode: &feed::Episode, path: &Path) -> 
     }
 
     ctx.log(format!(
-        "{}: on-disk size {} doesn't match the feed's {}, downloading again",
+        "{}: on-disk size {} is short of the feed's {}, downloading again",
         path.file_name().unwrap_or_default().to_string_lossy(),
         util::human_bytes(size),
         episode.length.map(util::human_bytes).unwrap_or_default()
@@ -711,6 +805,7 @@ async fn fetch_feed(ctx: &Ctx, url: &str) -> Result<String, String> {
         match result {
             Ok(body) => return Ok(body),
             Err(e) => {
+                logs::debug(format!("{url}: attempt {attempt} of {ATTEMPTS} failed: {e}"));
                 last = e;
                 if attempt < ATTEMPTS {
                     tokio::time::sleep(Duration::from_millis(400 * attempt as u64)).await;
@@ -725,6 +820,7 @@ async fn download_episode(
     ctx: &Ctx,
     feed_index: usize,
     ep_index: usize,
+    show: &Show,
     episode: &feed::Episode,
     path: &Path,
 ) -> EpisodeStatus {
@@ -744,9 +840,13 @@ async fn download_episode(
             return EpisodeStatus::Cancelled;
         }
 
-        match transfer(ctx, feed_index, ep_index, episode, path).await {
+        match transfer(ctx, feed_index, ep_index, show, episode, path).await {
             Ok(status) => return status,
             Err(e) => {
+                logs::debug(format!(
+                    "{}: attempt {attempt} of {ATTEMPTS} failed: {e}",
+                    path.display()
+                ));
                 last = e;
                 if attempt < ATTEMPTS {
                     tokio::time::sleep(Duration::from_millis(600 * attempt as u64)).await;
@@ -755,6 +855,10 @@ async fn download_episode(
         }
     }
 
+    // A note rather than a problem, and the only failure here that is: the
+    // status returned on the next line is what the window turns into the
+    // episode's own failure line, so calling this one a failure too would put
+    // the same lost episode in the log twice.
     ctx.log(format!(
         "{}: {last}",
         path.file_name().unwrap_or_default().to_string_lossy()
@@ -769,6 +873,7 @@ async fn transfer(
     ctx: &Ctx,
     feed_index: usize,
     ep_index: usize,
+    show: &Show,
     episode: &feed::Episode,
     path: &Path,
 ) -> Result<EpisodeStatus, String> {
@@ -793,6 +898,21 @@ async fn transfer(
     // The server may ignore our Range header, in which case we start over.
     let resuming = existing > 0 && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
     let already = if resuming { existing } else { 0 };
+
+    logs::debug(format!(
+        "{}: {} said {}{}",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        episode.url,
+        resp.status(),
+        match (existing, resuming) {
+            (0, _) => String::new(),
+            (had, true) => format!(", resuming from {}", util::human_bytes(had)),
+            (had, false) => format!(
+                ", starting over — the {} already here was not resumable",
+                util::human_bytes(had)
+            ),
+        }
+    ));
 
     let total = resp
         .content_length()
@@ -837,6 +957,14 @@ async fn transfer(
         .await
         .map_err(|e| format!("cannot finish {}: {e}", path.display()))?;
 
+    logs::debug(format!(
+        "{}: {} written",
+        path.display(),
+        util::human_bytes(done)
+    ));
+
+    tag_episode(ctx, show, episode, path).await;
+
     ctx.send(Update::Progress {
         feed: feed_index,
         episode: ep_index,
@@ -844,6 +972,62 @@ async fn transfer(
         total: Some(done),
     });
     Ok(EpisodeStatus::Done)
+}
+
+/// Write what the feed said about the episode into the file that just landed.
+///
+/// The file is named after the minute it was published, so the tags are the
+/// only place its title, show and blurb survive being copied onto a phone. A
+/// tag that won't write is worth a line in the log and nothing more: the
+/// episode itself is here and plays, which is what was asked for.
+async fn tag_episode(ctx: &Ctx, show: &Show, episode: &feed::Episode, path: &Path) {
+    let details = tags::Details {
+        show: show.title.clone(),
+        title: episode.title.clone(),
+        published: episode.published,
+        description: episode.description.clone(),
+        feed_url: show.feed_url.clone(),
+    };
+    let target = path.to_path_buf();
+
+    // Rewriting a file is blocking work, and on a large episode with an
+    // existing tag it is not instant; it does not belong on the runtime.
+    let written = tokio::task::spawn_blocking(move || tags::write(&target, &details)).await;
+    let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+
+    match written {
+        Ok(Ok(tags::Tagged::Written)) => logs::debug(format!(
+            "{name}: tagged as \"{}\" from \"{}\"",
+            episode.title, show.title
+        )),
+
+        // Not every container carries ID3 — an .m4a keeps its metadata in an
+        // atom of its own — and forcing a tag onto one would break the file.
+        //
+        // Worth saying out loud, once: for this podcast the file name is all
+        // there is, and a folder of bare timestamps with nothing inside them to
+        // explain it would otherwise look like the run had lost something.
+        Ok(Ok(tags::Tagged::Unsupported)) => {
+            logs::debug(format!("{name}: not a container that takes ID3 tags"));
+            if !show.said_untaggable.swap(true, Ordering::Relaxed) {
+                ctx.log(format!(
+                    "{}: these episodes aren't in a format that takes ID3 tags, so they \
+                     are named by publication time and nothing else",
+                    show.title
+                ));
+            }
+        }
+
+        // The episode is here and plays; only the description of it was lost.
+        // Said as a failure because it is one, and said plainly because
+        // running again will not put it right — the file is complete, so the
+        // next run skips it. Deleting it is what asks for another try.
+        Ok(Err(e)) => ctx.problem(format!(
+            "{name}: downloaded, but could not write its tags: {e}. \
+             Delete it and run again to try once more."
+        )),
+        Err(e) => ctx.problem(format!("{name}: could not write its tags: {e}")),
+    }
 }
 
 /// Build a name that hasn't been handed out yet, appending ` (2)`, ` (3)` ... on
@@ -891,8 +1075,15 @@ mod tests {
 
     /// The bytes every test episode is made of. Deterministic so a resumed
     /// download can be checked byte for byte against what it should have been.
+    ///
+    /// It opens with an MPEG frame sync because that is how the tagger tells an
+    /// MP3 from something merely called one; without it these episodes would go
+    /// untagged and the tests would be exercising a path real episodes don't
+    /// take.
     fn media() -> Vec<u8> {
-        (0..100_000u32).map(|i| (i % 251) as u8).collect()
+        let mut bytes = vec![0xFF, 0xFB, 0x90, 0x00];
+        bytes.extend((0..100_000u32).map(|i| (i % 251) as u8));
+        bytes
     }
 
     /// A single-purpose HTTP server, so the download path is exercised over a
@@ -1295,6 +1486,17 @@ mod tests {
         out
     }
 
+    /// The media, as it is once the episode has been tagged: the tag goes on
+    /// the front, and every byte that was downloaded is still behind it.
+    fn assert_is_the_episode(path: &Path) {
+        let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        assert!(
+            bytes.ends_with(&media()),
+            "{} is not the episode that was downloaded",
+            path.display()
+        );
+    }
+
     #[test]
     fn downloads_every_episode_into_a_folder_per_podcast() {
         let base = start_server();
@@ -1304,24 +1506,33 @@ mod tests {
 
         let updates = run_engine(settings.clone());
 
-        // The date prefix comes from pubDate; the second episode has none, and
-        // its extension comes from the MIME type because the URL has none.
-        let first = show.join("2025-08-05 - Episode One.mp3");
+        // The name is the minute the episode was published. The second has no
+        // pubDate to make one from so it falls back to its title, and its
+        // extension comes from the MIME type because the URL has none.
+        let first = show.join("050825-1000.mp3");
         let second = show.join("Episode Two.mp3");
 
-        assert_eq!(std::fs::read(&first).expect("first episode"), media());
-        assert_eq!(std::fs::read(&second).expect("second episode"), media());
+        assert_is_the_episode(&first);
+        assert_is_the_episode(&second);
 
         // The 404 leaves no file behind, not a zero-byte one.
         assert!(!show.join("Gone.mp3").exists());
         assert_eq!(
             outcomes(&updates),
             vec![
-                ("2025-08-05 - Episode One.mp3".to_string(), EpisodeStatus::Done),
+                ("050825-1000.mp3".to_string(), EpisodeStatus::Done),
                 ("Episode Two.mp3".to_string(), EpisodeStatus::Done),
                 ("Gone.mp3".to_string(), EpisodeStatus::Failed("server said 404 Not Found".into())),
             ]
         );
+
+        // The name says only when; everything else about the episode has to be
+        // in the file, or the run has thrown it away.
+        let tag = id3::Tag::read_from_path(&first).expect("tags on the episode");
+        use id3::TagLike;
+        assert_eq!(tag.title(), Some("Episode One"));
+        assert_eq!(tag.album(), Some("My Show"));
+        assert_eq!(tag.year(), Some(2025));
 
         // No half-finished files are left lying around.
         let leftovers: Vec<_> = std::fs::read_dir(&show)
@@ -1360,16 +1571,13 @@ mod tests {
 
         // Half an episode, as an interrupted run would have left it.
         let media = media();
-        let part = show.join("2025-08-05 - Episode One.mp3.part");
+        let part = show.join("050825-1000.mp3.part");
         std::fs::write(&part, &media[..40_000]).expect("write part");
 
         run_engine(settings);
 
         // The resumed half plus the fetched half is the whole file, in order.
-        assert_eq!(
-            std::fs::read(show.join("2025-08-05 - Episode One.mp3")).expect("episode"),
-            media
-        );
+        assert_is_the_episode(&show.join("050825-1000.mp3"));
         assert!(!part.exists(), "the .part file should have been renamed away");
     }
 
@@ -1382,12 +1590,12 @@ mod tests {
         std::fs::create_dir_all(&show).expect("create show dir");
 
         // Truncated by an interrupted copy, but the feed declares 100000 bytes.
-        let episode = show.join("2025-08-05 - Episode One.mp3");
+        let episode = show.join("050825-1000.mp3");
         std::fs::write(&episode, b"truncated").expect("write stub");
 
         let updates = run_engine(settings);
 
-        assert_eq!(std::fs::read(&episode).expect("episode"), media());
+        assert_is_the_episode(&episode);
         assert_eq!(outcomes(&updates)[0].1, EpisodeStatus::Done);
     }
 

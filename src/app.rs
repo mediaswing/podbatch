@@ -27,6 +27,7 @@ use egui::{AtomExt as _, RichText, Ui};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::engine::{self, Cancel, EpisodeStatus, FeedStatus, Plan, Proceed, Settings, Update};
+use crate::logs;
 use crate::opml;
 use crate::sound::{self, Cue};
 use crate::theme::{self, CONTROL_HEIGHT, PROGRESS_HEIGHT};
@@ -144,6 +145,21 @@ enum Dialog {
     Stop,
 }
 
+impl Dialog {
+    /// The question, as the debug log names it — a run that did nothing is
+    /// usually a question somebody answered, and this is what says which.
+    fn describe(&self) -> String {
+        match self {
+            Dialog::Confirm(plan) => format!(
+                "\"download {} episode(s), {}?\"",
+                plan.episodes,
+                human_bytes(plan.bytes)
+            ),
+            Dialog::Stop => "\"stop downloading?\"".to_string(),
+        }
+    }
+}
+
 /// A speed to estimate from, and where it came from — which decides how the
 /// estimate built on it can honestly be worded.
 #[derive(Clone, Copy)]
@@ -232,6 +248,24 @@ enum OutputKind {
     Good,
     Muted,
     Bad,
+}
+
+impl OutputKind {
+    /// How a line of this colour is filed in `output.log` unless it says
+    /// otherwise.
+    ///
+    /// Green is something that worked and red is something that didn't, both
+    /// without exception. Grey is not an outcome at all — it is the colour of a
+    /// line that is quieter than the rest, which covers a skipped episode but
+    /// also "Stopping…" and where the logs are being kept. Those go down as
+    /// notes, and the one caller that really does mean "skipped" says so.
+    fn outcome(self) -> logs::Outcome {
+        match self {
+            OutputKind::Good => logs::Outcome::Done,
+            OutputKind::Bad => logs::Outcome::Failed,
+            OutputKind::Plain | OutputKind::Muted => logs::Outcome::Note,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -333,6 +367,19 @@ impl PodBatchApp {
             last_cue: None,
         };
 
+        // Said once, at the top of the box: a log nobody can find is no better
+        // than one that was never written.
+        match logs::status() {
+            Ok(dir) => app.say(
+                OutputKind::Muted,
+                format!("Logging to {}", dir.display()),
+            ),
+            Err(e) => app.say(
+                OutputKind::Bad,
+                format!("No log files this time — {e}"),
+            ),
+        }
+
         if let Some(path) = opml_path {
             app.load_opml(path);
         }
@@ -393,7 +440,16 @@ impl PodBatchApp {
 
     // ---- output box -------------------------------------------------------
 
+    /// Put a line in the output box — and, since this is every line the user is
+    /// ever shown, in `output.log` as well. The box scrolls back only so far
+    /// and empties when the window closes; the file is the copy that keeps.
     fn say(&mut self, kind: OutputKind, text: String) {
+        self.say_as(kind, kind.outcome(), text);
+    }
+
+    /// The same, for the line whose outcome its colour doesn't give away.
+    fn say_as(&mut self, kind: OutputKind, outcome: logs::Outcome, text: String) {
+        logs::record(outcome, &text);
         self.output.push(OutputLine { text, kind });
         if self.output.len() > OUTPUT_LIMIT {
             let excess = self.output.len() - OUTPUT_LIMIT;
@@ -471,6 +527,20 @@ impl PodBatchApp {
         self.cancelling = false;
         self.outcome = None;
         self.downloads_began = None;
+
+        // The box is cleared for the new run; the debug log is where the
+        // settings a run was given can still be read afterwards.
+        logs::debug(format!(
+            "run starting: {} podcast(s), into {}, {} at a time, limit {}, skip existing {}",
+            subscriptions.len(),
+            self.out_dir.display(),
+            self.concurrency,
+            match self.limit_enabled {
+                true => self.limit.max(1).to_string(),
+                false => "none".to_string(),
+            },
+            self.skip_existing
+        ));
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let cancel = Cancel::new();
@@ -599,6 +669,7 @@ impl PodBatchApp {
 
     /// The user said yes.
     fn agreed(&mut self, dialog: Dialog) {
+        logs::debug(format!("answered yes to {}", dialog.describe()));
         match dialog {
             Dialog::Confirm(_) => {
                 if let Some(proceed) = &self.proceed {
@@ -618,6 +689,7 @@ impl PodBatchApp {
     /// The user said no. Declining to start is declining the run, so the engine
     /// waiting behind the question is let go rather than left holding it.
     fn declined(&mut self, dialog: Dialog) {
+        logs::debug(format!("answered no to {}", dialog.describe()));
         match dialog {
             Dialog::Confirm(_) => self.stop(),
             // Carrying on: if the plan arrived while this was up, it is now
@@ -796,8 +868,9 @@ impl PodBatchApp {
                     // the output box a record of the run rather than a log of
                     // things that went wrong.
                     let show = row.title.clone();
-                    // What landed on disk is named by its file; what didn't is
-                    // named by the episode it was going to be.
+                    // Named by the episode throughout, with the file it landed
+                    // in after it: the file name is a timestamp now, and on its
+                    // own it says nothing about which episode just arrived.
                     let file = ep.file_name.clone();
                     let title = ep.title.clone();
                     let size = human_bytes(ep.done);
@@ -806,12 +879,13 @@ impl PodBatchApp {
                             want(CUE_EPISODE_DONE, Cue::Success);
                             self.say(
                                 OutputKind::Good,
-                                format!("{MARK_DONE} {show} — {file} ({size})"),
+                                format!("{MARK_DONE} {show} — {title} → {file} ({size})"),
                             );
                         }
-                        EpisodeStatus::Skipped => self.say(
+                        EpisodeStatus::Skipped => self.say_as(
                             OutputKind::Muted,
-                            format!("{MARK_SKIPPED} {show} — {file} (already downloaded)"),
+                            logs::Outcome::Skipped,
+                            format!("{MARK_SKIPPED} {show} — {title} → {file} (already downloaded)"),
                         ),
                         EpisodeStatus::Failed(e) => {
                             want(CUE_SOMETHING_FAILED, Cue::Failure);
@@ -839,6 +913,7 @@ impl PodBatchApp {
                     }
                 }
                 Update::Log(line) => self.say(OutputKind::Plain, line),
+                Update::Problem(line) => self.say(OutputKind::Bad, line),
                 Update::Planned(plan) => {
                     if plan.episodes == 0 {
                         // Nothing to fetch is nothing to ask about, and the

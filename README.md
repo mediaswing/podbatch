@@ -74,19 +74,61 @@ part-downloaded files and all, which the next run picks up where they stopped.
 ```
 ~/podcasts/
   Some Podcast/
-    2025-08-05 - The Episode Title.mp3
-    2025-07-29 - An Earlier One.mp3
+    050825-1000.mp3
+    290725-0730.mp3
 ```
 
 Folder names come from the OPML entry rather than the feed's own title, so they
 are the same on every run and can be worked out before a single feed is fetched.
-Episode files are named from the publication date and title, so they sort into
-order. Anything a filesystem would object to is replaced, and two episodes with
-the same name get `(2)`, `(3)` and so on.
+
+Episode files are named after the minute the episode was published, as
+`ddmmyy-hhmm`. Every name is the same width and holds nothing a filesystem could
+object to, and two episodes published in the same minute get `(2)`, `(3)` and so
+on. Publication times are normalised to UTC first, so shows in different zones
+are named on the same clock.
+
+A feed that gives no publication date leaves nothing to stamp — those episodes
+keep a name made from their title instead, rather than being given an invented
+time that claims something about them that isn't true.
+
+Note that `ddmmyy` is written the way a date is read here, not the way a
+filesystem sorts one: ordered by name, 1 January 2025 comes before 2 January
+2024. Sort by date modified, or by the date in the file's tags, to get episodes
+in the order they were published.
 
 The extension comes from the enclosure URL when it has a believable one and from
 the MIME type otherwise — plenty of feeds serve episodes from a tracking URL
 with no extension at all.
+
+**Upgrading from 1.1 or earlier:** episodes downloaded before this used
+`YYYY-MM-DD - Episode Title.mp3`, and nothing looks for those names any more, so
+the first run after upgrading fetches a library it already has and leaves the
+old files beside the new ones. Move the old folders aside first if that matters
+to you.
+
+### What the file says about itself
+
+The name says only when, so everything else goes into the file's ID3 tags,
+where podcast players and music libraries already look for it:
+
+| Frame | What goes in it |
+| --- | --- |
+| Title | The episode's own title |
+| Artist, Album artist, Album | The podcast, as the OPML file names it |
+| Genre | `Podcast` |
+| Year, Recording time | The publication date and time |
+| Comment, `TDES` | The episode's blurb, with the HTML taken out |
+| `WFED` | The feed URL, so a file that has been moved still says where it came from |
+
+Any tag the publisher already put in the file is kept and written back
+underneath ours, so embedded cover art survives. Tags are only written to the
+containers that carry ID3 — MP3, AIFF and WAV. An `.m4a` or an `.ogg` keeps its
+metadata somewhere else entirely and is left alone rather than corrupted, and
+which is which is decided by reading the front of the file rather than by
+trusting its extension: that extension is a guess made from the enclosure URL
+and the MIME type, and a feed that gives neither gets `.mp3` by default. If a
+tag can't be written the episode still counts as downloaded, with a line in the
+output saying why.
 
 ### Interrupted downloads
 
@@ -96,9 +138,41 @@ file that looks finished. Start again and it resumes from where it stopped,
 using an HTTP range request when the server supports one and starting over when
 it doesn't.
 
-If a file on disk is a different size from the one the feed declares, it is
-downloaded again — that mismatch is what a copy interrupted after the rename
-looks like.
+If a file on disk is shorter than the feed declares, it is downloaded again —
+that is what a copy interrupted after the rename looks like. Shorter rather than
+different, because the tags written after a download add bytes the feed's figure
+knows nothing about.
+
+## The logs
+
+Two files, in the folder the platform keeps application data in:
+
+| Platform | Folder |
+| --- | --- |
+| Windows | `%APPDATA%\PodBatch` |
+| macOS | `~/Library/Application Support/PodBatch` |
+| Linux | `~/.local/share/PodBatch` |
+
+`output.log` is the record of what the run did — one line per operation, tagged
+`DONE`, `SKIP`, `FAIL` or `----` for the notes in between. It is the same
+account the output box gives, except that it keeps: the box holds the last 2000
+lines of the current run and empties when the window closes.
+
+`debug.log` is how it did it: every feed fetched, every retry and why, which
+episode became which file name, every resume and range request, every tag
+written, and any panic on the way out. It also carries everything `output.log`
+has, so it reads as one story rather than half of one.
+
+Both are stamped in UTC — a portable program has no reliable way to find the
+local zone offset, and a log timestamped an hour out is worse than an honest
+`Z`. The size is checked as the app starts: a file already past 2 MB is moved
+aside to `.log.old` and a fresh one begun, so the folder keeps two generations
+and a machine that runs this nightly doesn't grow a log for ever. A single
+session that writes past 2 MB carries on writing until it is restarted.
+
+The window says where the logs are going in its first line of output, and says
+so plainly if they couldn't be opened — a read-only home directory costs you the
+logs, and nothing else.
 
 ## Running it
 
@@ -124,8 +198,8 @@ cargo test
 
 The tests include the download engine end to end: they stand up a real HTTP
 server on a loopback port and check that episodes land in the right folders with
-the right bytes, that a half-finished `.part` file resumes rather than starting
-over, and that a wrong-sized file is fetched again.
+the right bytes and the right tags, that a half-finished `.part` file resumes
+rather than starting over, and that a short file is fetched again.
 
 ## Feeds it understands
 

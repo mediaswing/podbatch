@@ -26,6 +26,10 @@ roxmltree = "0.21.1"
 # Only for the two end-of-run cues, which are WAV — no other format is needed.
 rodio = { version = "0.22.2", default-features = false, features = ["playback", "wav"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "fs", "io-util", "sync", "time"] }
+# Episode files are named after their publication time, so what the episode
+# actually is has to live in its tags. Default features off: the only one is
+# picture decoding, and we never read the artwork we take care to preserve.
+id3 = { version = "1.17.1", default-features = false }
 
 [profile.release]
 opt-level = 2

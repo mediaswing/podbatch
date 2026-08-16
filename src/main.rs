@@ -13,8 +13,10 @@
 mod app;
 mod engine;
 mod feed;
+mod logs;
 mod opml;
 mod sound;
+mod tags;
 mod theme;
 mod util;
 
@@ -22,6 +24,17 @@ mod util;
 const APP_TITLE: &str = "Podcast Downloader";
 
 fn main() -> eframe::Result<()> {
+    // First, so that everything after it — including a panic on the way up — is
+    // on the record. The window says where the logs went, or why there are none.
+    let _ = logs::open();
+    log_panics();
+    logs::debug(format!(
+        "started {} {} on {}",
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS
+    ));
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(APP_TITLE)
@@ -46,6 +59,19 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| Ok(Box::new(app::PodBatchApp::new(cc, opml)))),
     )
+}
+
+/// Send panics to `debug.log` as well as wherever they were going.
+///
+/// A release build on Windows has no console attached, so the default hook
+/// writes the one message that would explain the window vanishing into a
+/// stream nobody is reading.
+fn log_panics() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        logs::debug(format!("PANIC {info}"));
+        previous(info);
+    }));
 }
 
 /// The first argument, if it names a file that exists.

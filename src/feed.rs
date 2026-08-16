@@ -12,8 +12,13 @@ pub struct Episode {
     /// Declared size in bytes, when the feed provides a believable one.
     pub length: Option<u64>,
     pub mime: Option<String>,
-    /// `YYYY-MM-DD`, when we could parse the publication date.
-    pub date: Option<String>,
+    /// When it was published, when we could parse the date. This is what the
+    /// file is named after, so it is wanted to the minute rather than the day.
+    pub published: Option<crate::util::Published>,
+    /// The episode's own blurb, with any markup taken out of it. Goes into the
+    /// file's tags, which is where a reader will look for it now that the file
+    /// name is a timestamp.
+    pub description: Option<String>,
 }
 
 /// Deliberately not carrying the channel's own `<title>`: folder names come
@@ -75,12 +80,21 @@ pub fn parse(text: &str) -> Result<Feed, FeedError> {
 
         let title = child_text(&item, "title").unwrap_or_else(|| "Untitled Episode".to_string());
 
-        let date = child_text(&item, "pubDate")
-            .and_then(|d| crate::util::rfc2822_date(&d))
-            .or_else(|| child_text(&item, "published").and_then(|d| iso_date(&d)))
-            .or_else(|| child_text(&item, "updated").and_then(|d| iso_date(&d)));
+        let published = child_text(&item, "pubDate")
+            .and_then(|d| crate::util::rfc2822(&d))
+            .or_else(|| child_text(&item, "published").and_then(|d| crate::util::iso8601(&d)))
+            .or_else(|| child_text(&item, "updated").and_then(|d| crate::util::iso8601(&d)));
 
-        episodes.push(Episode { title, url, length, mime, date });
+        // `itunes:summary` is plain text where `description` is often HTML, but
+        // it is also the one publishers leave stale; prefer the feed's own
+        // description and take the markup out of it.
+        let description = child_text(&item, "description")
+            .or_else(|| child_text(&item, "summary"))
+            .or_else(|| child_text(&item, "content"))
+            .map(|d| crate::util::strip_html(&d))
+            .filter(|d| !d.is_empty());
+
+        episodes.push(Episode { title, url, length, mime, published, description });
     }
 
     Ok(Feed { episodes })
@@ -164,20 +178,6 @@ fn attr<'a>(node: &roxmltree::Node<'a, 'a>, name: &str) -> Option<&'a str> {
         .map(|a| a.value())
 }
 
-/// Accept the date half of an ISO 8601 / RFC 3339 timestamp.
-fn iso_date(input: &str) -> Option<String> {
-    let head: String = input.trim().chars().take(10).collect();
-    let bytes = head.as_bytes();
-    let shaped = bytes.len() == 10
-        && bytes[4] == b'-'
-        && bytes[7] == b'-'
-        && bytes
-            .iter()
-            .enumerate()
-            .all(|(i, b)| matches!(i, 4 | 7) || b.is_ascii_digit());
-    shaped.then_some(head)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,6 +189,7 @@ mod tests {
     <itunes:title>Wrong Title</itunes:title>
     <item>
       <title><![CDATA[Episode ]]><![CDATA[One]]></title>
+      <description><![CDATA[<p>A blurb &amp; a half.</p>]]></description>
       <pubDate>Tue, 05 Aug 2025 10:00:00 GMT</pubDate>
       <guid isPermaLink="false">ep-1</guid>
       <enclosure url="https://cdn.test/1.mp3" length="1234" type="audio/mpeg"/>
@@ -217,7 +218,11 @@ mod tests {
         assert_eq!(first.title, "Episode One");
         assert_eq!(first.url, "https://cdn.test/1.mp3");
         assert_eq!(first.length, Some(1234));
-        assert_eq!(first.date.as_deref(), Some("2025-08-05"));
+        assert_eq!(
+            first.published,
+            Some(crate::util::Published { year: 2025, month: 8, day: 5, hour: 10, minute: 0 })
+        );
+        assert_eq!(first.description.as_deref(), Some("A blurb & a half."));
 
         // length="0" means "we don't know", not "empty file".
         assert_eq!(feed.episodes[1].length, None);
@@ -237,7 +242,10 @@ mod tests {
         let feed = parse(atom).unwrap();
         assert_eq!(feed.episodes.len(), 1);
         assert_eq!(feed.episodes[0].url, "https://cdn.test/a.mp3");
-        assert_eq!(feed.episodes[0].date.as_deref(), Some("2025-08-05"));
+        assert_eq!(
+            feed.episodes[0].published.map(|p| p.stamp()).as_deref(),
+            Some("050825-1000")
+        );
     }
 
     #[test]
