@@ -1698,7 +1698,10 @@ fn elide_path(path: &Path) -> String {
     if let Some(home) = dirs::home_dir()
         && let Ok(rest) = path.strip_prefix(&home)
     {
-        return format!("~/{}", rest.display());
+        // `rest` still uses the platform's own separator, so building the
+        // rest of the string with the same one is what keeps `~\Downloads`
+        // from coming out as `~/Downloads\Sub` on Windows.
+        return format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display());
     }
     path.display().to_string()
 }
@@ -2311,9 +2314,13 @@ mod tests {
     #[test]
     fn elides_the_home_directory() {
         if let Some(home) = dirs::home_dir() {
-            assert_eq!(elide_path(&home.join("podcasts")), "~/podcasts");
+            let want = format!("~{}podcasts", std::path::MAIN_SEPARATOR);
+            assert_eq!(elide_path(&home.join("podcasts")), want);
         }
-        assert_eq!(elide_path(Path::new("/opt/media")), "/opt/media");
+        // A path outside the home directory is shown exactly as it is, on
+        // whichever platform's own separator it was built with.
+        let outside = Path::new(".").join("opt").join("media");
+        assert_eq!(elide_path(&outside), outside.display().to_string());
     }
 
     /// An app with no egui context behind it, for testing the parts that are

@@ -12,6 +12,23 @@
 /// library copied onto another machine keeps working.
 const ILLEGAL: &[char] = &['/', '\\', ':', '*', '?', '"', '<', '>', '|'];
 
+/// Windows treats these as device names rather than files, whatever the case
+/// and even with an extension after them — `nul.mp3` is exactly as unusable
+/// as `nul`. A show or episode titled just one of these words — "Con",
+/// "Aux" and "Null" all being names real podcasts use — would otherwise sail
+/// through the character check and then fail to ever be created.
+const RESERVED: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// Whether `name` is, up to its first dot, one of the names Windows reserves
+/// for devices — the part an extension gets appended after.
+fn is_windows_reserved(name: &str) -> bool {
+    let base = name.split('.').next().unwrap_or(name);
+    RESERVED.iter().any(|r| r.eq_ignore_ascii_case(base))
+}
+
 /// Turn arbitrary feed text into something safe to use as a single path
 /// component. Never returns an empty string.
 pub fn sanitize(name: &str) -> String {
@@ -40,11 +57,19 @@ pub fn sanitize(name: &str) -> String {
     // file on Unix. Neither is what the feed author meant.
     let trimmed = out.trim().trim_end_matches('.').trim_start_matches('.').trim();
 
-    let cleaned = if trimmed.is_empty() { "untitled" } else { trimmed };
+    let cleaned = if trimmed.is_empty() {
+        "untitled".to_string()
+    } else if is_windows_reserved(trimmed) {
+        // An underscore keeps the word readable rather than replacing it
+        // outright, and moves it off the exact name Windows refuses.
+        format!("{trimmed}_")
+    } else {
+        trimmed.to_string()
+    };
 
     // Leave room for a date prefix, an extension and a ".part" suffix inside the
     // usual 255-byte limit.
-    truncate_chars(cleaned, 150)
+    truncate_chars(&cleaned, 150)
 }
 
 /// Truncate on a character boundary, not a byte boundary.
@@ -459,6 +484,23 @@ mod tests {
         assert_eq!(sanitize("AC/DC:  Live?"), "AC DC Live");
         assert_eq!(sanitize("   "), "untitled");
         assert_eq!(sanitize(".hidden."), "hidden");
+    }
+
+    /// `CON`, `NUL` and the rest name a device on Windows, not a file — even
+    /// with an extension after them — so a show or episode that sanitises to
+    /// exactly one of these must not be handed back unchanged.
+    #[test]
+    fn sanitize_steers_clear_of_windows_device_names() {
+        assert_eq!(sanitize("CON"), "CON_");
+        assert_eq!(sanitize("con"), "con_");
+        assert_eq!(sanitize("Nul"), "Nul_");
+        assert_eq!(sanitize("Aux"), "Aux_");
+        assert_eq!(sanitize("COM1"), "COM1_");
+        assert_eq!(sanitize("Lpt3"), "Lpt3_");
+        // A word that only starts with a reserved name is a real title, not a
+        // device — "Console" must be left exactly as it was written.
+        assert_eq!(sanitize("Console"), "Console");
+        assert_eq!(sanitize("Nullable Podcast"), "Nullable Podcast");
     }
 
     #[test]
