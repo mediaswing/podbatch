@@ -21,7 +21,16 @@ Everything arrives ticked, because the usual answer is "all of them"; untick the
 few you don't want. **All** and **None** are there for when it isn't.
 
 **Transcripts** turns episodes you already have into text. Choose a folder, tick
-the episodes, and each one is written out as a `.txt` beside its audio.
+the episodes, and each one is written out beside its audio.
+
+The transcript is a Word document by default, set in Verdana at 16pt bold. A
+plain `.txt` opens at whatever size and weight the text editor feels like, which
+is usually small and light and means enlarging it by hand every single time; a
+`.docx` carries the size and weight with it and reflows when you make it bigger.
+PDF is there too, for a fixed layout that prints predictably — it is set in a
+typewriter face, because that is the only kind of font a PDF can rely on without
+embedding one. Plain text remains an option, and the size and boldness are
+yours to change.
 
 It leans on programs it does not ship. FFmpeg converts the audio, because
 Whisper reads 16 kHz WAV and a podcast is an mp3; whisper.cpp does the

@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 use egui::{AtomExt as _, RichText, Ui};
 use tokio::sync::mpsc::UnboundedReceiver;
 
+use crate::document;
 use crate::engine::{self, Cancel, EpisodeStatus, FeedStatus, Plan, Proceed, Settings, Update};
 use crate::logs;
 use crate::opml;
@@ -399,6 +400,10 @@ pub struct PodBatchApp {
     /// to the same person. See the note in [`transcribe`].
     label_speakers: bool,
     skip_transcribed: bool,
+    /// What a transcript is written as, and how big and bold. Kept here rather
+    /// than in the engine's settings so the choice survives between runs.
+    transcript_format: document::Format,
+    transcript_style: document::Style,
 
     transcribing: bool,
     transcribe_cancel: Option<Cancel>,
@@ -456,6 +461,8 @@ impl PodBatchApp {
             tools: Vec::new(),
             label_speakers: true,
             skip_transcribed: true,
+            transcript_format: document::Format::default(),
+            transcript_style: document::Style::default(),
             transcribing: false,
             transcribe_cancel: None,
             transcribe_rx: None,
@@ -1689,7 +1696,8 @@ impl PodBatchApp {
         self.audio = files
             .into_iter()
             .map(|path| {
-                let transcribed = transcribe::transcript_path(&path).is_file();
+                let transcribed =
+                    transcribe::transcript_path(&path, self.transcript_format).is_file();
                 AudioRow {
                     name: path
                         .file_name()
@@ -1792,6 +1800,8 @@ impl PodBatchApp {
                 model,
                 label_speakers: labelling,
                 skip_existing: self.skip_transcribed,
+                format: self.transcript_format,
+                style: self.transcript_style,
             },
             tx,
             cancel.clone(),
@@ -2361,6 +2371,48 @@ impl PodBatchApp {
                 );
             }
         });
+
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Write it as");
+            let before = self.transcript_format;
+            egui::ComboBox::from_id_salt("transcript-format")
+                .selected_text(self.transcript_format.label())
+                .show_ui(ui, |ui| {
+                    for format in document::Format::all() {
+                        ui.selectable_value(
+                            &mut self.transcript_format,
+                            format,
+                            format.label(),
+                        );
+                    }
+                });
+
+            ui.add_space(12.0);
+            // Greyed out for plain text rather than hidden: a control that
+            // vanishes leaves you wondering where the setting went, and the
+            // answer — "that format cannot carry it" — is worth showing.
+            let styled = self.transcript_format != document::Format::Text;
+            ui.add_enabled_ui(!busy && styled, |ui| {
+                ui.label("Size");
+                ui.add(egui::DragValue::new(&mut self.transcript_style.size).range(8..=48))
+                    .on_hover_text("Point size of the text in the file, not of this window.");
+                ui.checkbox(&mut self.transcript_style.bold, "Bold");
+            });
+
+            // Changing the format changes the file name we look for, so what
+            // counts as "already transcribed" changes with it.
+            if before != self.transcript_format
+                && let Some(dir) = self.audio_dir.clone()
+            {
+                self.load_audio_folder(dir);
+            }
+        });
+        ui.label(
+            RichText::new(self.transcript_format.note())
+                .color(muted)
+                .small(),
+        );
     }
 
     fn settings_pane(&mut self, ui: &mut Ui) {
@@ -3671,10 +3723,14 @@ mod tests {
 
     /// An episode with a transcript beside it starts unticked, so "transcribe"
     /// on a folder half done means the half that isn't.
+    ///
+    /// Which file counts as "the transcript" follows the chosen format: a `.txt`
+    /// sitting next to an episode says nothing about whether the Word document
+    /// you asked for exists.
     #[test]
     fn an_already_transcribed_episode_starts_unticked() {
         let dir = folder_of_audio(&["done.mp3", "todo.mp3"]);
-        std::fs::write(dir.join("done.txt"), "a transcript").expect("write");
+        std::fs::write(dir.join("done.docx"), "a transcript").expect("write");
 
         let mut app = test_app();
         app.load_audio_folder(dir.clone());
@@ -3683,6 +3739,14 @@ mod tests {
         let todo = app.audio.iter().find(|a| a.name == "todo.mp3").expect("todo");
         assert!(!done.selected, "an existing transcript should start unticked");
         assert!(todo.selected);
+
+        // Switch format and the .docx no longer answers the question.
+        app.transcript_format = document::Format::Pdf;
+        app.load_audio_folder(dir.clone());
+        assert!(
+            app.audio.iter().all(|a| a.selected),
+            "a .docx should not count as a PDF transcript"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3921,6 +3985,8 @@ mod tests {
             tools: Vec::new(),
             label_speakers: true,
             skip_transcribed: true,
+            transcript_format: document::Format::default(),
+            transcript_style: document::Style::default(),
             transcribing: false,
             transcribe_cancel: None,
             transcribe_rx: None,

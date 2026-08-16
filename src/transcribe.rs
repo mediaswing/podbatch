@@ -12,7 +12,7 @@
 //! podcast is an mp3 or an m4a. Whisper does the listening. The `-tdrz` model
 //! marks the moments the speaker changes — that is all it can do; it hears *a*
 //! change, not *who* changed — so on its own the best the transcript can say is
-//! that a new person is talking, and every turn gets the next number up.
+//! that the voice has swapped, and turns alternate between two speakers.
 //!
 //! Ollama is what turns those turns into people. It never hears the audio; it
 //! reads the turns Whisper already found and decides which of them are the same
@@ -31,6 +31,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::document;
 use crate::engine::Cancel;
 use crate::logs;
 use crate::tools;
@@ -64,6 +65,9 @@ pub struct Settings {
     pub label_speakers: bool,
     /// Leave a file alone when its transcript is already sitting next to it.
     pub skip_existing: bool,
+    /// What the transcript is written as, and how big and bold the text is.
+    pub format: document::Format,
+    pub style: document::Style,
 }
 
 /// Where a file has got to. `Working` carries which of the three programs is
@@ -201,7 +205,7 @@ fn run(settings: &Settings, ctx: &Ctx) {
             break;
         }
 
-        let destination = transcript_path(path);
+        let destination = transcript_path(path, settings.format);
         if settings.skip_existing && destination.is_file() {
             ctx.send(Update::Status { file: index, status: Status::Skipped });
             ctx.log(format!("{} — already transcribed", name_of(path)));
@@ -273,7 +277,14 @@ fn transcribe_one(
         }
     }
 
-    write_transcript(destination, source, &turns, labeller.is_some())
+    write_transcript(
+        destination,
+        source,
+        &turns,
+        labeller.is_some(),
+        settings.format,
+        settings.style,
+    )
 }
 
 /// Step one: whatever the episode is, into the one format Whisper reads.
@@ -674,9 +685,9 @@ fn clip(text: &str) -> String {
 
 // ---- output ---------------------------------------------------------------
 
-/// Where a transcript goes: beside the audio, same name, `.txt`.
-pub fn transcript_path(audio: &Path) -> PathBuf {
-    audio.with_extension("txt")
+/// Where a transcript goes: beside the audio, same name, the chosen extension.
+pub fn transcript_path(audio: &Path, format: document::Format) -> PathBuf {
+    audio.with_extension(format.extension())
 }
 
 fn write_transcript(
@@ -684,6 +695,8 @@ fn write_transcript(
     source: &Path,
     turns: &[Turn],
     labelled: bool,
+    format: document::Format,
+    style: document::Style,
 ) -> Result<(), String> {
     let mut out = String::new();
     out.push_str(&format!("{}\n", name_of(source)));
@@ -714,7 +727,7 @@ fn write_transcript(
         ));
     }
 
-    std::fs::write(destination, out).map_err(|e| format!("could not write the transcript — {e}"))
+    document::write(destination, format, style, &out)
 }
 
 /// Seconds as `HH:MM:SS`, which is how you find your place in an episode.
@@ -895,6 +908,14 @@ mod tests {
         let source = PathBuf::from(source);
         assert!(source.is_file(), "{} is not a file", source.display());
 
+        // `PODBATCH_TEST_FORMAT=docx` etc., so the same run can be pointed at
+        // whichever writer is being checked.
+        let format = match std::env::var("PODBATCH_TEST_FORMAT").as_deref() {
+            Ok("docx") => document::Format::Docx,
+            Ok("pdf") => document::Format::Pdf,
+            _ => document::Format::Text,
+        };
+
         let ffmpeg = tools::find_program("ffmpeg").expect("ffmpeg");
         let whisper = tools::whisper_binary().expect("whisper");
         let model = tools::model_path();
@@ -916,6 +937,8 @@ mod tests {
                 model,
                 label_speakers: false,
                 skip_existing: false,
+                format,
+                style: document::Style::default(),
             },
             tx,
             cancel,
@@ -938,11 +961,22 @@ mod tests {
         assert!(finished, "the run never finished");
         assert!(problems.is_empty(), "problems: {problems:?}");
 
-        let transcript = transcript_path(&audio);
-        let written = std::fs::read_to_string(&transcript).expect("a transcript");
-        assert!(written.contains("Speaker 1:"), "no speaker: {written:.400}");
-        assert!(written.contains("[00:00:"), "no timestamps: {written:.400}");
-        println!("--- transcript head ---\n{:.800}", written);
+        let transcript = transcript_path(&audio, format);
+        let bytes = std::fs::read(&transcript).expect("a transcript");
+        assert!(!bytes.is_empty(), "the transcript is empty");
+
+        // Kept where it can be opened and looked at, which for a format written
+        // by hand is the only check that really counts.
+        let kept = std::env::temp_dir().join(format!("podbatch-e2e.{}", format.extension()));
+        std::fs::copy(&transcript, &kept).expect("keep a copy");
+        println!("wrote {} ({} bytes)", kept.display(), bytes.len());
+
+        if format == document::Format::Text {
+            let written = String::from_utf8(bytes).expect("utf8");
+            assert!(written.contains("Speaker 1:"), "no speaker: {written:.400}");
+            assert!(written.contains("[00:00:"), "no timestamps: {written:.400}");
+            println!("--- transcript head ---\n{:.600}", written);
+        }
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -957,8 +991,18 @@ mod tests {
     #[test]
     fn a_transcript_goes_next_to_its_audio() {
         assert_eq!(
-            transcript_path(Path::new("/shows/ep/2024-01-01 Episode.mp3")),
+            transcript_path(
+                Path::new("/shows/ep/2024-01-01 Episode.mp3"),
+                document::Format::Text
+            ),
             PathBuf::from("/shows/ep/2024-01-01 Episode.txt")
+        );
+        assert_eq!(
+            transcript_path(
+                Path::new("/shows/ep/2024-01-01 Episode.mp3"),
+                document::Format::Docx
+            ),
+            PathBuf::from("/shows/ep/2024-01-01 Episode.docx")
         );
     }
 
@@ -992,7 +1036,15 @@ mod tests {
             (false, "alternate between two voices"),
         ] {
             let out = dir.join("ep.txt");
-            write_transcript(&out, Path::new("ep.mp3"), &turns, labelled).expect("write");
+            write_transcript(
+                &out,
+                Path::new("ep.mp3"),
+                &turns,
+                labelled,
+                document::Format::Text,
+                document::Style::default(),
+            )
+            .expect("write");
             let written = std::fs::read_to_string(&out).expect("read");
             assert!(written.contains(expected), "{written}");
             assert!(written.contains("[00:00:01] Speaker 1: Hello."), "{written}");
