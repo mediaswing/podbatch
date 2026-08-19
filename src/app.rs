@@ -1,10 +1,12 @@
 //! The window.
 //!
-//! Two tabs. **Downloads** is the one the app opens on and the one that does the
-//! work: the subscription list goes in at the top, the podcasts it contains are
-//! listed on the left to be picked from, what the run is doing is written on the
-//! right, and the progress bar spans the width underneath both. **Settings**
-//! holds the things that are set once and then left alone.
+//! Three tabs. **Downloads** is the one the app opens on and the one that does
+//! the work: the subscription list goes in at the top, the podcasts it contains
+//! are listed on the left to be picked from, what the run is doing is written on
+//! the right, and the progress bar spans the width underneath both.
+//! **Transcripts** turns episodes already on disk into text, laid out the same
+//! way and driven by [`transcribe`](crate::transcribe) rather than the download
+//! engine. **Settings** holds the things that are set once and then left alone.
 //!
 //! The OPML is read as soon as it is chosen rather than when the run starts,
 //! because the list of podcasts is what the left pane is for — you cannot choose
@@ -1274,11 +1276,11 @@ impl PodBatchApp {
 
     // ---- panes ------------------------------------------------------------
 
-    /// Two tabs, splitting the full width of the window between them.
+    /// Three tabs, splitting the full width of the window between them.
     ///
-    /// Full width rather than two small buttons in the corner: they are the only
-    /// navigation the app has, so they are worth being unmissable and easy to
-    /// hit, and a target that spans half the window is both.
+    /// Full width rather than three small buttons in the corner: they are the
+    /// only navigation the app has, so they are worth being unmissable and easy
+    /// to hit, and a target that spans a third of the window is both.
     fn tab_bar(&mut self, ui: &mut Ui) {
         let tabs = [
             (Tab::Downloads, "Downloads"),
