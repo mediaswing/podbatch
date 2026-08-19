@@ -543,30 +543,45 @@ pub fn install(
     args: &[String],
     mut on_line: impl FnMut(String),
 ) -> Result<(), String> {
-    use std::io::{BufRead, BufReader};
-
     logs::debug(format!("installing: {program} {}", args.join(" ")));
 
     let mut child = Command::new(program)
         .args(args)
-        // Both streams into one pipe, in the order they were written: package
-        // managers put progress on stderr and results on stdout, and a log that
-        // interleaves them is the one that reads like what happened.
+        // Package managers put progress on stderr and results on stdout, and a
+        // log that interleaves them is the one that reads like what happened.
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .stdin(std::process::Stdio::null())
         .spawn()
         .map_err(|e| format!("Could not run {program} — {e}"))?;
 
+    // Both streams are drained at once, each by a thread of its own, and the
+    // lines are brought back together over one channel.
+    //
+    // Reading one to the end and then the other is what this looked like first,
+    // and it deadlocks: a pipe holds about 64 KB, and a child that fills its
+    // stderr while we are still reading its stdout blocks in `write` and never
+    // reaches the end of either. `brew install` is chatty enough on stderr to
+    // do it, and the symptom is the worst kind — the window sits there with a
+    // half-finished install and no way out but Stop.
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let mut pumps = Vec::new();
     if let Some(out) = child.stdout.take() {
-        for line in BufReader::new(out).lines().map_while(Result::ok) {
-            on_line(line);
-        }
+        pumps.push(pump(out, tx.clone()));
     }
     if let Some(err) = child.stderr.take() {
-        for line in BufReader::new(err).lines().map_while(Result::ok) {
-            on_line(line);
-        }
+        pumps.push(pump(err, tx.clone()));
+    }
+    // The sender the pumps were cloned from, dropped so that the loop below
+    // ends when the last of them does rather than waiting on a sender nothing
+    // will ever send down.
+    drop(tx);
+
+    for line in rx {
+        on_line(line);
+    }
+    for pump in pumps {
+        pump.join().ok();
     }
 
     let status = child
@@ -584,6 +599,25 @@ pub fn install(
                 .unwrap_or_else(|| "no exit code".into())
         ))
     }
+}
+
+/// Read one of a child's streams to the end, line by line, onto a channel.
+///
+/// On its own thread: see [`install`]. A send that fails means the receiver has
+/// gone, which is the signal to stop reading rather than an error to report.
+fn pump<R: std::io::Read + Send + 'static>(
+    stream: R,
+    tx: std::sync::mpsc::Sender<String>,
+) -> std::thread::JoinHandle<()> {
+    use std::io::{BufRead as _, BufReader};
+
+    std::thread::spawn(move || {
+        for line in BufReader::new(stream).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    })
 }
 
 /// Fetch a file, reporting bytes as they land.
@@ -768,6 +802,24 @@ mod tests {
         assert!(!truncated, "a short file passed as a complete model");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A child that fills its stderr while we are reading its stdout must not
+    /// be able to wedge an install. Draining one stream and then the other hung
+    /// here for ever — so a regression fails this by never finishing, which is
+    /// worth knowing before wondering why the suite has stopped.
+    #[test]
+    #[cfg(unix)]
+    fn a_noisy_stderr_does_not_wedge_the_install() {
+        // Comfortably more than a pipe holds, written to stderr before a single
+        // byte goes to stdout.
+        let script = "head -c 200000 /dev/zero | tr '\\000' '\\n' >&2; echo finished";
+        let mut lines = 0usize;
+
+        install("sh", &["-c".to_string(), script.to_string()], |_| lines += 1)
+            .expect("the install should have finished");
+
+        assert!(lines > 1000, "only {lines} lines came back");
     }
 
     #[test]
