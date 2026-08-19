@@ -168,12 +168,14 @@ fn run(settings: &Settings, ctx: &Ctx) {
     // One scratch directory for the whole run, emptied at the end. The WAVs are
     // large — an hour of audio is a little over 100 MB once converted — and
     // leaving them behind would quietly fill a disk over a few runs.
-    let scratch = scratch_dir();
-    if let Err(e) = std::fs::create_dir_all(&scratch) {
-        ctx.problem(format!("Nowhere to put the converted audio — {e}"));
-        ctx.send(Update::Finished { cancelled: false });
-        return;
-    }
+    let scratch = match make_scratch_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            ctx.problem(format!("Nowhere to put the converted audio — {e}"));
+            ctx.send(Update::Finished { cancelled: false });
+            return;
+        }
+    };
 
     // Asked once, not once per file: the answer cannot change mid-run, and a
     // run that quietly stopped labelling half way would be worse than one that
@@ -742,10 +744,73 @@ fn name_of(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
-/// A scratch directory of our own, named for the process so two copies of the
-/// app running at once cannot tread on each other's converted audio.
-fn scratch_dir() -> PathBuf {
-    std::env::temp_dir().join(format!("podbatch-transcribe-{}", std::process::id()))
+/// A scratch directory of our own, made fresh and readable only by us.
+///
+/// The name carries randomness rather than the process id. A pid is a small
+/// number and a guessable one, and the temp directory is shared between users
+/// on most Linux systems — not on macOS or Windows, where it is per-user, but
+/// this app builds and runs on all three. A guessable name in a shared
+/// directory is one somebody else can create first, and then an episode's audio
+/// is converted into a folder of their choosing rather than ours.
+///
+/// [`std::fs::create_dir`] rather than `create_dir_all` is the other half of
+/// that: it fails on a path that already exists, so a directory somebody
+/// prepared in advance — or a symlink pointing at one they can read — is an
+/// error rather than the place the WAVs quietly go. On Unix the mode is
+/// narrowed to 0700 as well, because the default leaves a run's converted audio
+/// world-readable for as long as the run lasts.
+fn make_scratch_dir() -> std::io::Result<PathBuf> {
+    let base = std::env::temp_dir();
+    let mut collision = None;
+
+    // Eight attempts is seven more than should ever be needed; the loop is here
+    // because the one thing we must not do on a name that is taken is use it.
+    for _ in 0..8 {
+        let path = base.join(format!("podbatch-transcribe-{:016x}", random_suffix()));
+        match create_private_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => collision = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(collision
+        .unwrap_or_else(|| std::io::Error::other("could not find an unused name")))
+}
+
+/// Make one directory, failing if it is already there, and on Unix keeping it
+/// to ourselves.
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        // Not `recursive`, so an existing path is the error it needs to be.
+        std::fs::DirBuilder::new().mode(0o700).create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir(path)
+    }
+}
+
+/// Sixty-four bits that cannot be guessed, without taking a dependency for it.
+///
+/// `RandomState` is the standard library's hash seed, which it takes from the
+/// operating system — the property wanted here — and mixing the clock in as
+/// well means two directories asked for in the same process are distinct even
+/// if the seed somehow were not.
+fn random_suffix() -> u64 {
+    use std::hash::{BuildHasher as _, Hasher as _};
+
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u64(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0),
+    );
+    hasher.write_u32(std::process::id());
+    hasher.finish()
 }
 
 /// The audio files in a folder, sorted, ignoring anything we cannot feed to
@@ -773,6 +838,32 @@ mod tests {
 
     fn seg(start: f64, text: &str, turn_ends: bool) -> Segment {
         Segment { start, text: text.into(), turn_ends }
+    }
+
+    /// Two runs must not be handed the same directory, and neither must a
+    /// directory somebody else prepared: the name is unguessable and making it
+    /// fails outright if it is already there.
+    #[test]
+    fn a_scratch_directory_is_new_and_ours_alone() {
+        let first = make_scratch_dir().expect("a scratch directory");
+        let second = make_scratch_dir().expect("a second scratch directory");
+        assert_ne!(first, second, "two runs were given the same directory");
+
+        // The name of one that already exists is refused rather than reused.
+        assert_eq!(
+            create_private_dir(&first).map_err(|e| e.kind()),
+            Err(std::io::ErrorKind::AlreadyExists)
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&first).expect("metadata").permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "the converted audio was left readable");
+        }
+
+        std::fs::remove_dir_all(&first).ok();
+        std::fs::remove_dir_all(&second).ok();
     }
 
     #[test]
