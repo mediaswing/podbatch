@@ -1837,12 +1837,12 @@ impl PodBatchApp {
                 self.say(OutputKind::Plain, format!("Running: {display}"));
                 Some(Ok((program, args)))
             }
-            tools::Install::Download { url, to, bytes } => {
+            tools::Install::Download { url, to, bytes, sha256 } => {
                 self.say(
                     OutputKind::Plain,
                     format!("Downloading {} ({})", tool.label(), human_bytes(bytes)),
                 );
-                Some(Err((url, to)))
+                Some(Err((url, to, sha256)))
             }
             tools::Install::Guided { .. } | tools::Install::Manual { .. } => None,
         };
@@ -1863,9 +1863,10 @@ impl PodBatchApp {
                         let send_line = |line: String| send(InstallUpdate::Line(line));
                         tools::install(&program, &args, send_line)
                     }
-                    Err((url, to)) => tools::download(
+                    Err((url, to, sha256)) => tools::download(
                         &url,
                         &to,
+                        Some(sha256),
                         |done, total| send(InstallUpdate::Progress { done, total }),
                         || cancel.is_cancelled(),
                     ),

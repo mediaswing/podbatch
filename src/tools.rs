@@ -21,13 +21,30 @@ use crate::logs;
 /// The tinydiarize model: `small.en`, retrained to mark where the speaker
 /// changes. It is the only Whisper model that emits `[SPEAKER_TURN]`, which is
 /// the whole reason the transcripts can be broken into speakers at all.
-pub const MODEL_URL: &str =
-    "https://huggingface.co/akashmjn/tinydiarize-whisper.cpp/resolve/main/ggml-small.en-tdrz.bin";
+///
+/// Pinned to a commit rather than `resolve/main`. `main` is a branch, and a
+/// branch is whatever it was last pointed at — fetching from it means the file
+/// that arrives is decided by the repository at download time rather than by
+/// us. What arrives here is fed straight to whisper.cpp's ggml loader, which is
+/// a C parser doing no favours for a file it did not expect.
+pub const MODEL_URL: &str = "https://huggingface.co/akashmjn/tinydiarize-whisper.cpp/resolve/\
+     d44ba793fc67e509623a88a409723311fa677744/ggml-small.en-tdrz.bin";
 pub const MODEL_FILE: &str = "ggml-small.en-tdrz.bin";
 /// What the download costs, so the user is told before agreeing rather than
 /// after. Checked against the real file by `tests::the_model_size_is_honest`,
 /// which is ignored by default because it hits the network.
 pub const MODEL_BYTES: u64 = 487_614_184;
+/// SHA-256 of that file, checked before it is put in place.
+///
+/// The size alone was never an integrity check — it is a progress bar that can
+/// also catch a truncated download. This is the thing that says the half a
+/// gigabyte we just fetched is the half a gigabyte we asked for, whatever
+/// happened between here and Hugging Face. It is the git-lfs oid of the blob,
+/// which is defined to be its SHA-256, and
+/// `tests::the_model_digest_is_the_one_upstream_publishes` re-checks it against
+/// the live API.
+pub const MODEL_SHA256: &str =
+    "ceac3ec06d1d98ef71aec665283564631055fd6129b79d8e1be4f9cc33cc54b4";
 
 /// The Ollama model used to turn detected speaker *turns* into stable speaker
 /// *identities*. Small on purpose: it is doing bookkeeping over text, not
@@ -207,8 +224,14 @@ pub enum Install {
         /// command that actually runs.
         display: String,
     },
-    /// A file to fetch. Size is known up front so the box can quote it.
-    Download { url: String, to: PathBuf, bytes: u64 },
+    /// A file to fetch. Size is known up front so the box can quote it, and the
+    /// digest so what arrives can be checked before it is used.
+    Download {
+        url: String,
+        to: PathBuf,
+        bytes: u64,
+        sha256: &'static str,
+    },
     /// Needs a terminal — a password, or a prompt only a human can answer. We
     /// show it rather than run it.
     Guided { command: String, why: String },
@@ -435,14 +458,12 @@ pub fn plan(tool: Tool, manager: Option<Manager>) -> Install {
             url: MODEL_URL.to_string(),
             to: model_path(),
             bytes: MODEL_BYTES,
+            sha256: MODEL_SHA256,
         },
-        Tool::OllamaModel => Install::Run {
-            program: find_program("ollama")
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "ollama".into()),
-            args: vec!["pull".into(), OLLAMA_MODEL.into()],
-            display: format!("ollama pull {OLLAMA_MODEL}"),
-        },
+        Tool::OllamaModel => Install::run(
+            resolved("ollama"),
+            vec!["pull".into(), OLLAMA_MODEL.into()],
+        ),
         Tool::Ffmpeg | Tool::Whisper | Tool::Ollama => match manager {
             Some(m) => package_install(m, tool),
             None => Install::Guided {
@@ -461,16 +482,14 @@ fn package_install(manager: Manager, tool: Tool) -> Install {
         return unpackaged(tool);
     };
     let (program, args) = manager.install_args(package);
-    let display = std::iter::once(program.clone())
-        .chain(args.iter().cloned())
-        .collect::<Vec<_>>()
-        .join(" ");
 
     // A command that will stop dead on a password prompt is not one we can run
     // for somebody: from a windowed app there is nowhere for them to type it.
+    // The bare name is right here — this is a line to paste into a terminal,
+    // where it will be resolved by the shell the user is sitting in front of.
     if manager.needs_root() {
         return Install::Guided {
-            command: display,
+            command: spelled_out(&program, &args),
             why: format!(
                 "Installing {} with {} needs an administrator password, which has to be \
                  typed at a terminal.",
@@ -480,7 +499,42 @@ fn package_install(manager: Manager, tool: Tool) -> Install {
         };
     }
 
-    Install::Run { program, args, display }
+    Install::run(resolved(&program), args)
+}
+
+/// The absolute path of a program, when we can find one.
+///
+/// `Command::new("brew")` is resolved against `PATH` at the moment it runs, and
+/// on Windows against the current directory before that. Neither is a thing to
+/// leave open when the command is an installer: whatever the survey found is
+/// what the confirmation box was written about, and it is what should run.
+/// Falling back to the bare name keeps a machine whose `PATH` we cannot read
+/// working as it did.
+fn resolved(program: &str) -> String {
+    find_program(program)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| program.to_string())
+}
+
+/// A command written out as one line, for the box that asks about it.
+fn spelled_out(program: &str, args: &[String]) -> String {
+    std::iter::once(program.to_string())
+        .chain(args.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+impl Install {
+    /// A runnable install, with `display` written from the very fields that get
+    /// handed to `Command`.
+    ///
+    /// The only way to build an [`Install::Run`] outside this module's tests, so
+    /// that the line the user agrees to cannot drift from the line that runs —
+    /// which is the whole job of that field.
+    fn run(program: String, args: Vec<String>) -> Install {
+        let display = spelled_out(&program, &args);
+        Install::Run { program, args, display }
+    }
 }
 
 /// The two things no package manager we drive will install for us.
@@ -630,9 +684,15 @@ fn pump<R: std::io::Read + Send + 'static>(
 /// interrupted fetch can never be mistaken for a finished model. That matters
 /// more than usual here: half a Whisper model is a file that exists, is the
 /// wrong size, and makes Whisper fail with something unhelpful.
+///
+/// `expect` is the SHA-256 the finished file must have. It is computed as the
+/// bytes arrive — the file is far too big to be worth reading twice — and
+/// checked before the rename, so a file that fails it is deleted and never
+/// occupies the name of a model something else will later load.
 pub fn download(
     url: &str,
     to: &Path,
+    expect: Option<&str>,
     mut on_progress: impl FnMut(u64, Option<u64>),
     cancelled: impl Fn() -> bool,
 ) -> Result<(), String> {
@@ -672,12 +732,14 @@ pub fn download(
             .map_err(|e| format!("Could not write {} — {e}", part.display()))?;
 
         let mut done = 0u64;
+        let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
             if cancelled() {
                 return Err("stopped".into());
             }
             let chunk = chunk.map_err(|e| format!("The download broke off — {e}"))?;
+            digest.update(&chunk);
             file.write_all(&chunk)
                 .await
                 .map_err(|e| format!("Could not write {} — {e}", part.display()))?;
@@ -687,6 +749,19 @@ pub fn download(
         file.flush()
             .await
             .map_err(|e| format!("Could not finish writing — {e}"))?;
+
+        if let Some(expected) = expect {
+            let actual = hex(digest.finish().as_ref());
+            if !actual.eq_ignore_ascii_case(expected) {
+                logs::debug(format!("{url} hashed to {actual}, expected {expected}"));
+                return Err(
+                    "The download did not match the file it should have been, so it has been \
+                     discarded. Try again — if it keeps happening, something between here and \
+                     the download is changing it."
+                        .into(),
+                );
+            }
+        }
         Ok(())
     })
     .inspect_err(|_| {
@@ -694,6 +769,11 @@ pub fn download(
     })?;
 
     std::fs::rename(&part, to).map_err(|e| format!("Could not put the file in place — {e}"))
+}
+
+/// Lower-case hex, for comparing a digest against one written down as a string.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Open a terminal with the command already on the clipboard's behalf — or, on
@@ -776,15 +856,70 @@ mod tests {
 
     #[test]
     fn homebrew_installs_are_ones_we_can_run() {
-        let Install::Run { display, .. } = plan(Tool::Ffmpeg, Some(Manager::Homebrew)) else {
-            panic!("expected a runnable install");
-        };
-        assert_eq!(display, "brew install ffmpeg");
+        for (tool, package) in [(Tool::Ffmpeg, "ffmpeg"), (Tool::Whisper, "whisper-cpp")] {
+            let Install::Run { program, args, .. } = plan(tool, Some(Manager::Homebrew)) else {
+                panic!("expected a runnable install for {tool:?}");
+            };
+            // Absolute where brew was found, the bare name where it was not, so
+            // this has to hold on a machine with Homebrew and one without.
+            assert!(
+                program == "brew" || program.ends_with("/brew") || program.ends_with("\\brew"),
+                "{program} is not brew"
+            );
+            assert_eq!(args, vec!["install".to_string(), package.to_string()]);
+        }
+    }
 
-        let Install::Run { display, .. } = plan(Tool::Whisper, Some(Manager::Homebrew)) else {
+    /// The line in the confirmation box has to be the line that runs. It is
+    /// built from the same two fields handed to `Command`, and this is what
+    /// says so — a `display` written separately could drift from them.
+    #[test]
+    fn what_is_agreed_to_is_what_is_run() {
+        let runnable = [
+            plan(Tool::Ffmpeg, Some(Manager::Homebrew)),
+            plan(Tool::Whisper, Some(Manager::Homebrew)),
+            plan(Tool::Ollama, Some(Manager::Homebrew)),
+            plan(Tool::OllamaModel, Some(Manager::Homebrew)),
+        ];
+        for install in runnable {
+            let Install::Run { program, args, display } = install else {
+                panic!("expected a runnable install");
+            };
+            assert_eq!(display, spelled_out(&program, &args));
+        }
+    }
+
+    /// A program we run is one we located, not a name looked up again at spawn
+    /// time — on Windows that lookup includes the current directory.
+    #[test]
+    fn a_runnable_install_names_the_program_we_found() {
+        let Install::Run { program, .. } = plan(Tool::OllamaModel, None) else {
             panic!("expected a runnable install");
         };
-        assert_eq!(display, "brew install whisper-cpp");
+        match find_program("ollama") {
+            Some(found) => assert_eq!(program, found.display().to_string()),
+            None => assert_eq!(program, "ollama"),
+        }
+    }
+
+    /// The digest travels with the download, so nothing can ask for the model
+    /// without also saying what it has to hash to.
+    #[test]
+    fn the_model_download_carries_its_checksum() {
+        let Install::Download { sha256, bytes, url, .. } = plan(Tool::WhisperModel, None) else {
+            panic!("expected a download");
+        };
+        assert_eq!(sha256, MODEL_SHA256);
+        assert_eq!(bytes, MODEL_BYTES);
+        assert_eq!(sha256.len(), 64, "a SHA-256 is 64 hex characters");
+        assert!(sha256.chars().all(|c| c.is_ascii_hexdigit()));
+        // A branch is whatever it was last pointed at; a commit is a file.
+        assert!(!url.contains("/resolve/main/"), "{url} is pinned to a branch");
+    }
+
+    #[test]
+    fn hex_is_lower_case_and_padded() {
+        assert_eq!(hex(&[0x00, 0x0f, 0xa0, 0xff]), "000fa0ff");
     }
 
     /// The size in the confirmation box is the size that gets downloaded, and a
@@ -844,5 +979,25 @@ mod tests {
             .max()
             .expect("a content-length");
         assert_eq!(length, MODEL_BYTES);
+    }
+
+    /// The pinned digest, against the one Hugging Face publishes. A git-lfs oid
+    /// is defined to be the SHA-256 of the blob, so the API can be asked what
+    /// the file hashes to without fetching half a gigabyte to find out.
+    #[test]
+    #[ignore = "hits huggingface.co"]
+    fn the_model_digest_is_the_one_upstream_publishes() {
+        let out = Command::new("curl")
+            .args([
+                "-s",
+                "https://huggingface.co/api/models/akashmjn/tinydiarize-whisper.cpp/tree/main",
+            ])
+            .output()
+            .expect("curl");
+        let body = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            body.contains(MODEL_SHA256),
+            "{MODEL_SHA256} is not the oid upstream lists"
+        );
     }
 }
