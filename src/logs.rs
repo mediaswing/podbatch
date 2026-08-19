@@ -1,6 +1,7 @@
-//! The two log files, in the folder the platform keeps application data in:
-//! `%APPDATA%\PodBatch` on Windows, `~/Library/Application Support/PodBatch` on
-//! macOS, `~/.local/share/PodBatch` on Linux.
+//! The two log files, in `~/Podbatch/Logging` — alongside the folder the
+//! episodes themselves are saved in, so everything the app produces is under one
+//! roof the user can find without being told where their platform hides
+//! application data.
 //!
 //! * `output.log` — what the run did. One line per operation that succeeded,
 //!   was skipped or failed: the same account the output box gives, kept after
@@ -24,8 +25,12 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::util;
 
-/// The folder the two files go in, under the platform's data directory.
-const FOLDER: &str = "PodBatch";
+/// The folder the two files go in, under the home directory.
+const FOLDER: &[&str] = &["Podbatch", "Logging"];
+
+/// Where they go instead on a system with no home directory at all, under
+/// whatever the platform calls its application data folder.
+const FALLBACK_FOLDER: &str = "PodBatch";
 
 /// A log already bigger than this when the app starts is moved aside, so a
 /// machine that runs this every night doesn't quietly grow a log until the disk
@@ -109,12 +114,16 @@ pub fn status() -> Result<PathBuf, String> {
 }
 
 fn folder_path() -> Option<PathBuf> {
-    // `data_dir` is `%APPDATA%` on Windows, which is where the user asked for
-    // these; `config_dir` is the same folder there and a reasonable second
-    // choice everywhere else.
+    if let Some(home) = dirs::home_dir() {
+        return Some(FOLDER.iter().fold(home, |path, part| path.join(part)));
+    }
+
+    // No home directory is vanishingly rare — a service account, a locked-down
+    // kiosk — but it is the one case where insisting on `~` would mean no logs
+    // at all, so the platform's own data folder stands in.
     dirs::data_dir()
         .or_else(dirs::config_dir)
-        .map(|dir| dir.join(FOLDER))
+        .map(|dir| dir.join(FALLBACK_FOLDER))
 }
 
 /// Open a log for appending, moving it aside first if it has grown too big.
@@ -216,6 +225,17 @@ mod tests {
         }
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The logs live with the downloads, under one folder in the home
+    /// directory, rather than wherever the platform files application data —
+    /// which is a place most people cannot name, let alone find.
+    #[test]
+    fn the_logs_go_under_the_home_directory() {
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+        assert_eq!(folder_path(), Some(home.join("Podbatch").join("Logging")));
     }
 
     #[test]

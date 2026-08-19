@@ -1,7 +1,7 @@
 # Podcast Downloader
 
 Point it at the OPML file your podcast app exports and it downloads the
-episodes, giving every podcast a folder of its own under `~/podcasts`.
+episodes, giving every podcast a folder of its own under `~/Podbatch/Downloads`.
 
 It is a desktop app rather than a script because choosing which of forty
 subscriptions to fetch, and watching sixty large files come down over a slow
@@ -24,11 +24,12 @@ few you don't want. **All** and **None** are there for when it isn't.
 
 | Setting | Default | What it does |
 | --- | --- | --- |
-| Save episodes in | `~/podcasts` | Each podcast gets a subfolder of its own in here. |
+| Save episodes in | `~/Podbatch/Downloads` | Each podcast gets a subfolder of its own in here. Point it anywhere you like — an external drive, say, since a full subscription list runs to gigabytes. |
 | Skip episodes already downloaded | on | Leaves a file alone when it is already on disk at the size the feed claims. Turn it off to fetch everything again. |
 | Only the newest *N* episodes | off | Takes the first *N* items in each feed, which is the newest *N* — feeds are published newest-first. |
 | Downloads at once | 4 | How many files are fetched in parallel, across all podcasts. |
 | Sound as episodes land | on | A cue as each episode finishes, a different one when something fails, and a last one when the run ends. |
+| Appearance | System | Light, dark, or whatever this computer is set to. Both looks are built to the same contrast standard. |
 
 ## Before it starts
 
@@ -62,17 +63,21 @@ downloaded there is no question to ask, so none is asked.
 
 Answering **Cancel**, or pressing Escape, ends the run there. Nothing has been
 written: not an episode, not a `.part` file, not so much as a folder — reading
-the feeds is all that has happened, and it happens entirely in memory.
+the feeds is all that has happened, and it happens entirely in memory. It counts
+as stopping the run, so the sweep below runs too, and any fragment an earlier
+interrupted run left behind goes with it.
 
 Stopping asks too. Escape during a run — like the **Stop** button, which asks
 the same question — puts up a box rather than abandoning the run on a keypress
-that is as often hit by accident as on purpose. Saying yes stops it as before,
-part-downloaded files and all, which the next run picks up where they stopped.
+that is as often hit by accident as on purpose. Saying yes stops the run and
+sweeps up after it: every episode that has already landed stays where it is, and
+the ones that were still arriving are deleted rather than left as unplayable
+fragments. Starting again picks up from the last complete episode.
 
 ## What it writes
 
 ```
-~/podcasts/
+~/Podbatch/Downloads/
   Some Podcast/
     050825-1000.mp3
     290725-0730.mp3
@@ -134,9 +139,18 @@ output saying why.
 
 An episode is written to a `.part` file and only renamed into place once it has
 arrived in full, so a run that is stopped or killed never leaves a truncated
-file that looks finished. Start again and it resumes from where it stopped,
-using an HTTP range request when the server supports one and starting over when
-it doesn't.
+file that looks finished. Start again and a `.part` file that is still there
+resumes from where it stopped, using an HTTP range request when the server
+supports one and starting over when it doesn't.
+
+Stopping a run deliberately is the one case where nothing is kept. When the run
+ends because you stopped it, a sweep goes through the episodes it was fetching
+and deletes their `.part` files — a run you stopped should not cost you disk
+space in fragments you cannot play. Everything that had already been renamed
+into place is a complete episode and is left alone, so the next run has less to
+do rather than more. A run that ends by itself sweeps nothing: a `.part` file at
+that point belongs to an episode that failed, and it is what the next run
+resumes from.
 
 If a file on disk is shorter than the feed declares, it is downloaded again —
 that is what a copy interrupted after the rename looks like. Shorter rather than
@@ -145,13 +159,10 @@ knows nothing about.
 
 ## The logs
 
-Two files, in the folder the platform keeps application data in:
-
-| Platform | Folder |
-| --- | --- |
-| Windows | `%APPDATA%\PodBatch` |
-| macOS | `~/Library/Application Support/PodBatch` |
-| Linux | `~/.local/share/PodBatch` |
+Two files, in `~/Podbatch/Logging` — next door to the episodes, so everything
+the app writes is under one folder you can find without being told where your
+platform hides application data. The window says where they went the moment it
+opens, or why there are none.
 
 `output.log` is the record of what the run did — one line per operation, tagged
 `DONE`, `SKIP`, `FAIL` or `----` for the notes in between. It is the same
@@ -199,7 +210,8 @@ cargo test
 The tests include the download engine end to end: they stand up a real HTTP
 server on a loopback port and check that episodes land in the right folders with
 the right bytes and the right tags, that a half-finished `.part` file resumes
-rather than starting over, and that a short file is fetched again.
+rather than starting over, that a short file is fetched again, and that stopping
+a run mid-transfer leaves no fragment behind.
 
 ## Feeds it understands
 

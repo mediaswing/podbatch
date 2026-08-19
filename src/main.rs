@@ -2,7 +2,8 @@
 //!
 //! Point it at an OPML subscription list exported from a podcast app and it
 //! fetches every feed in the list and downloads every episode, giving each
-//! podcast a subfolder of its own under `~/podcasts`.
+//! podcast a subfolder of its own under `~/Podbatch/Downloads` — or wherever
+//! else the Settings tab has been pointed.
 //!
 //! The window is in [`app`], the network and disk work in [`engine`]; they only
 //! ever speak through a channel, so a slow feed can't freeze the UI.

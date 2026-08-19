@@ -288,6 +288,11 @@ pub struct PodBatchApp {
     limit: usize,
     skip_existing: bool,
     play_sounds: bool,
+    /// Light, dark, or whatever the operating system is set to. Held here as
+    /// well as in egui's own options so the Settings tab has something to bind
+    /// the buttons to; [`PodBatchApp::appearance`] is what keeps the two the
+    /// same.
+    theme: egui::ThemePreference,
 
     feeds: Vec<FeedRow>,
     /// Engine feed index -> index into `feeds`. The engine is only told about
@@ -348,6 +353,7 @@ impl PodBatchApp {
             limit: 10,
             skip_existing: true,
             play_sounds: true,
+            theme: egui::ThemePreference::System,
             feeds: Vec::new(),
             running_map: Vec::new(),
             output: Vec::new(),
@@ -366,6 +372,7 @@ impl PodBatchApp {
             measured_rate: None,
             last_cue: None,
         };
+        cc.egui_ctx.set_theme(app.theme);
 
         // Said once, at the top of the box: a log nobody can find is no better
         // than one that was never written.
@@ -732,10 +739,11 @@ impl PodBatchApp {
             Dialog::Stop => (
                 "Stop downloading?".to_string(),
                 vec![
-                    "The episodes part way through will be left where they are."
+                    "The episodes part way through are thrown away, so nothing half-finished \
+                     is left on the disk."
                         .to_string(),
-                    "Starting again picks each of them up from the point it stopped, so \
-                     nothing already fetched is fetched twice."
+                    "Every episode that has already landed stays where it is, and starting \
+                     again picks up from there."
                         .to_string(),
                 ],
                 "■ Stop",
@@ -1450,6 +1458,9 @@ impl PodBatchApp {
             );
 
         ui.add_space(12.0);
+        self.appearance(ui);
+
+        ui.add_space(12.0);
         ui.label(RichText::new("Keyboard").strong());
         ui.label(
             RichText::new(
@@ -1474,6 +1485,61 @@ impl PodBatchApp {
                     ui.end_row();
                 }
             });
+    }
+
+    /// Light or dark, or neither — which is the default, and means the app is
+    /// dark exactly when the machine is.
+    ///
+    /// Both palettes are built in [`theme`] and the whole window is drawn from
+    /// them, so this is a single call to egui rather than anything the panes
+    /// have to know about. The choice is offered anyway because the system
+    /// setting is not always the one that suits the room: a dark app in a bright
+    /// office is as hard to read as a white one at night, and a user who needs
+    /// the contrast a particular way round should not have to change their whole
+    /// machine to get it here.
+    ///
+    /// Three buttons rather than a dark-mode tick box, because "follow the
+    /// system" is a real answer and a two-state toggle cannot express it once it
+    /// has been left. They are ordinary buttons, so Tab reaches them and Space
+    /// or Enter presses them like everything else in the window.
+    fn appearance(&mut self, ui: &mut Ui) {
+        use egui::ThemePreference as Pref;
+
+        let muted = theme::palette(ui.visuals()).muted;
+
+        ui.label(RichText::new("Appearance").strong());
+        ui.horizontal(|ui| {
+            for (preference, label, hint) in [
+                (
+                    Pref::System,
+                    "System",
+                    "Match whatever this computer is set to, and follow it when it changes.",
+                ),
+                (Pref::Light, "Light", "Dark text on a light background."),
+                (Pref::Dark, "Dark", "Light text on a dark background."),
+            ] {
+                ui.selectable_value(&mut self.theme, preference, label)
+                    .on_hover_text(hint);
+            }
+
+            // Handed on only when the two disagree, which is the frame a button
+            // was pressed. Compared against what egui is actually holding rather
+            // than against the value from the top of this function: that way the
+            // preference gets through however it came to change, and the check
+            // stays true whatever else has been at it.
+            if ui.ctx().options(|options| options.theme_preference) != self.theme {
+                ui.ctx().set_theme(self.theme);
+                logs::debug(format!("theme set to {:?}", self.theme));
+            }
+        });
+        ui.label(
+            RichText::new(
+                "Both looks are built to the same contrast standard, so nothing becomes \
+                 harder to read either way round.",
+            )
+            .color(muted)
+            .small(),
+        );
     }
 }
 
@@ -1676,15 +1742,24 @@ impl FeedStatus {
     }
 }
 
-/// `~/podcasts`, or the current directory on the rare system with no home.
+/// `~/Podbatch/Downloads`, or the same under the current directory on the rare
+/// system with no home.
+///
+/// Only the starting point: the folder is a setting, and one the user is free to
+/// point anywhere they like — an external drive being the obvious case, since a
+/// full subscription list is measured in gigabytes. The logs go to
+/// `~/Podbatch/Logging` next door, so everything the app writes is under one
+/// folder rather than scattered between the home directory and wherever the
+/// platform keeps application data.
 fn default_out_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("podcasts")
+        .join("Podbatch")
+        .join("Downloads")
 }
 
 /// The nearest ancestor that exists, so the folder picker opens somewhere real
-/// even before `~/podcasts` has been created.
+/// even before `~/Podbatch/Downloads` has been created.
 fn existing_ancestor(path: &Path) -> PathBuf {
     path.ancestors()
         .find(|p| p.is_dir())
@@ -2311,6 +2386,69 @@ mod tests {
         assert!(cue_is_due(CUE_RUN_ENDED, Some(just_now), now));
     }
 
+    /// Where episodes go before anyone has said otherwise. It is only a
+    /// default — the folder is a setting — but it is the one almost every run
+    /// uses, and it sits next to `~/Podbatch/Logging` on purpose.
+    #[test]
+    fn episodes_default_to_a_folder_beside_the_logs() {
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(default_out_dir(), home.join("Podbatch").join("Downloads"));
+        }
+        // And whatever it is, the picker can open somewhere real from it.
+        assert!(existing_ancestor(&default_out_dir()).is_dir());
+    }
+
+    /// Choosing a theme has to reach egui, or the buttons move a field nothing
+    /// reads and the window carries on looking exactly as it did.
+    #[test]
+    fn choosing_a_theme_repaints_the_window_in_it() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+
+        let mut app = test_app();
+        app.tab = Tab::Settings;
+
+        // Dark by choice, whatever the machine this runs on is set to.
+        app.theme = egui::ThemePreference::System;
+        let painted = settings_frame(&ctx, &mut app, egui::ThemePreference::Dark);
+        assert_eq!(ctx.theme(), egui::Theme::Dark);
+        assert!(ctx.style_of(egui::Theme::Dark).visuals.dark_mode);
+
+        // And where the choice lives: in the Settings tab, between the last of
+        // the download settings and the keyboard reference — the pane is drawn
+        // for real here, so this is the section actually being on screen rather
+        // than a method that would draw it if anything called it.
+        for label in ["Appearance", "System", "Light", "Dark"] {
+            assert!(painted.contains(label), "no {label:?} in the pane: {painted}");
+        }
+        let at = |needle: &str| painted.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        assert!(at("Sound as episodes land") < at("Appearance"));
+        assert!(at("Appearance") < at("Keyboard"));
+
+        // And light, which is the same journey the other way.
+        settings_frame(&ctx, &mut app, egui::ThemePreference::Light);
+        assert_eq!(ctx.theme(), egui::Theme::Light);
+    }
+
+    /// One frame of the whole Settings tab, with `choice` picked from the
+    /// appearance buttons as if it had been clicked.
+    fn settings_frame(
+        ctx: &egui::Context,
+        app: &mut PodBatchApp,
+        choice: egui::ThemePreference,
+    ) -> String {
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            app.theme = choice;
+            app.settings_pane(ui);
+        });
+        let mut text = String::new();
+        for clipped in &output.shapes {
+            collect_text(&clipped.shape, &mut text);
+        }
+        output.textures_delta.clear();
+        text
+    }
+
     #[test]
     fn elides_the_home_directory() {
         if let Some(home) = dirs::home_dir() {
@@ -2335,6 +2473,7 @@ mod tests {
             limit: 10,
             skip_existing: true,
             play_sounds: false,
+            theme: egui::ThemePreference::System,
             feeds: Vec::new(),
             running_map: Vec::new(),
             output: Vec::new(),

@@ -331,8 +331,22 @@ async fn run(
         .collect()
         .await;
 
+    // Every file the second pass could leave half-written, worked out while the
+    // reads are still here to ask — the pass that fetches them consumes them,
+    // and a run that is stopped part way through has to know what to sweep up
+    // afterwards. Anything already on disk under one of these names is a
+    // fragment of the same episode from an earlier interrupted run, and goes
+    // the same way.
+    let leftovers: Vec<PathBuf> = reads
+        .iter()
+        .filter_map(|read| read.plan.as_ref())
+        .flat_map(|plan| &plan.episodes)
+        .map(|(_, _, path)| part_path(path))
+        .collect();
+
     if ctx.cancel.is_cancelled() {
         abandon(&ctx, &reads);
+        collect_garbage(&ctx, &leftovers).await;
         ctx.log("Stopped.".to_string());
         ctx.send(Update::Finished { cancelled: true });
         return;
@@ -373,6 +387,7 @@ async fn run(
     // everything finishes rather than stopping to ask about no work.
     if outstanding > 0 && !wait_for_go(&ctx).await {
         abandon(&ctx, &reads);
+        collect_garbage(&ctx, &leftovers).await;
         ctx.log("Stopped.".to_string());
         ctx.send(Update::Finished { cancelled: true });
         return;
@@ -389,6 +404,14 @@ async fn run(
 
     let cancelled = ctx.cancel.is_cancelled();
     logs::debug(format!("run finished, cancelled: {cancelled}"));
+
+    // Every transfer has returned by now, so the files below are nobody's any
+    // more and the ones still ending in `.part` are the ones that were stopped
+    // mid-flight.
+    if cancelled {
+        collect_garbage(&ctx, &leftovers).await;
+    }
+
     ctx.log(if cancelled {
         "Stopped.".to_string()
     } else {
@@ -879,10 +902,7 @@ async fn transfer(
 ) -> Result<EpisodeStatus, String> {
     let _permit = ctx.permits.acquire().await.map_err(|_| "shutting down")?;
 
-    let part = path.with_extension(format!(
-        "{}.part",
-        path.extension().unwrap_or_default().to_string_lossy()
-    ));
+    let part = part_path(path);
 
     // Resume a previous attempt if we left one behind.
     let existing = tokio::fs::metadata(&part).await.map(|m| m.len()).unwrap_or(0);
@@ -935,7 +955,9 @@ async fn transfer(
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
         if ctx.cancel.is_cancelled() {
-            // Flush what we have so the next run can resume from here.
+            // Flushed and dropped rather than simply abandoned, so the handle is
+            // closed before `collect_garbage` comes past to delete the file —
+            // Windows will not remove a file anything still has open.
             let _ = file.flush().await;
             return Ok(EpisodeStatus::Cancelled);
         }
@@ -1030,6 +1052,66 @@ async fn tag_episode(ctx: &Ctx, show: &Show, episode: &feed::Episode, path: &Pat
     }
 }
 
+/// Where an episode is written while it is still arriving: the file it will
+/// become, with `.part` on the end.
+///
+/// `episode.mp3` becomes `episode.mp3.part` rather than `episode.part`, so two
+/// episodes whose names differ only by extension can be in flight at once and
+/// so the original extension survives for anything reading the leftovers.
+///
+/// Appended rather than gone through `with_extension`, which would have to be
+/// handed the old extension and the new one glued together — and produces
+/// `episode..part` for a name that has none.
+fn part_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".part");
+    PathBuf::from(name)
+}
+
+/// Sweep up the half-finished files a stopped run left behind.
+///
+/// A `.part` file is the tail end of a transfer that was interrupted, and while
+/// one can be resumed, a run the user stopped is one they wanted to stop —
+/// leaving several gigabytes of unplayable fragments on their disk to make that
+/// point is not a kindness. So stopping takes them with it, and only stopping
+/// does: a run that ends on its own leaves any partial from a failed episode
+/// exactly where it is, for the next run to pick up from.
+///
+/// Called after every download task has returned, so nothing here is deleting a
+/// file another task still holds open — which on Windows would simply fail.
+/// Deletions are best-effort for the same reason logging is: a file that won't
+/// go away is worth a line in the log and nothing more.
+async fn collect_garbage(ctx: &Ctx, leftovers: &[PathBuf]) {
+    let mut files = 0usize;
+    let mut bytes = 0u64;
+
+    for path in leftovers {
+        let Ok(size) = tokio::fs::metadata(path).await.map(|m| m.len()) else {
+            continue;
+        };
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => {
+                logs::debug(format!(
+                    "swept up {} ({})",
+                    path.display(),
+                    util::human_bytes(size)
+                ));
+                files += 1;
+                bytes += size;
+            }
+            Err(e) => logs::debug(format!("could not sweep up {}: {e}", path.display())),
+        }
+    }
+
+    if files > 0 {
+        ctx.log(format!(
+            "Cleared away {files} unfinished file{} ({})",
+            if files == 1 { "" } else { "s" },
+            util::human_bytes(bytes)
+        ));
+    }
+}
+
 /// Build a name that hasn't been handed out yet, appending ` (2)`, ` (3)` ... on
 /// collision. `ext` may be empty for folder names.
 fn unique_name(stem: &str, ext: &str, taken: &mut Vec<String>) -> String {
@@ -1072,6 +1154,15 @@ mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Write};
     use std::net::{TcpListener, TcpStream};
+
+    /// How `/dribble.mp3` is paid out: twenty-five pieces a tenth of a second
+    /// apart, so reading the whole episode takes about two and a half seconds
+    /// however fast the machine running the test is — the waiting is the server
+    /// sleeping, so a slow runner does not shorten it. The timings in
+    /// `stopping_a_run_sweeps_up_the_file_it_was_part_way_through` are read off
+    /// these two numbers.
+    const DRIBBLE_CHUNKS: usize = 25;
+    const DRIBBLE_GAP: Duration = Duration::from_millis(100);
 
     /// The bytes every test episode is made of. Deterministic so a resumed
     /// download can be checked byte for byte against what it should have been.
@@ -1144,11 +1235,26 @@ mod tests {
 </channel></rss>"#
         );
 
+        // One episode served slowly enough that a run can be stopped while it is
+        // still arriving, which is the only way to catch a `.part` file in the
+        // act of existing.
+        let dribble_feed = format!(
+            r#"<?xml version="1.0"?>
+<rss version="2.0"><channel><title>Ignored</title>
+  <item>
+    <title>Episode One</title>
+    <pubDate>Tue, 05 Aug 2025 10:00:00 GMT</pubDate>
+    <enclosure url="{base}/dribble.mp3" length="100000" type="audio/mpeg"/>
+  </item>
+</channel></rss>"#
+        );
+
         let feeds: Vec<(String, String)> = vec![
             ("/feed.xml".to_string(), feed.clone()),
             ("/slow.xml".to_string(), feed),
             ("/probe.xml".to_string(), probe_feed),
             ("/resume.xml".to_string(), resume_feed),
+            ("/dribble.xml".to_string(), dribble_feed),
         ];
 
         std::thread::spawn(move || {
@@ -1259,6 +1365,25 @@ mod tests {
                         ),
                         &vec![0u8; body.len()],
                     ),
+                }
+            }
+            // The same bytes again, this time spread over a second and a half so
+            // that a run stopped part way through is genuinely stopped part way
+            // through. Range requests are ignored: every reader gets the whole
+            // file from the start, slowly.
+            "/dribble.mp3" => {
+                let body = media();
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let chunk = body.len().div_ceil(DRIBBLE_CHUNKS);
+                for piece in body.chunks(chunk) {
+                    if stream.write_all(piece).is_err() || stream.flush().is_err() {
+                        return;
+                    }
+                    std::thread::sleep(DRIBBLE_GAP);
                 }
             }
             // The same bytes as any other episode, dribbled out in two halves
@@ -1535,12 +1660,7 @@ mod tests {
         assert_eq!(tag.year(), Some(2025));
 
         // No half-finished files are left lying around.
-        let leftovers: Vec<_> = std::fs::read_dir(&show)
-            .expect("read show dir")
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.ends_with(".part"))
-            .collect();
+        let leftovers = leftover_parts(&show);
         assert!(leftovers.is_empty(), "left behind {leftovers:?}");
 
         // Second run over the same folder downloads nothing again.
@@ -1579,6 +1699,151 @@ mod tests {
         // The resumed half plus the fetched half is the whole file, in order.
         assert_is_the_episode(&show.join("050825-1000.mp3"));
         assert!(!part.exists(), "the .part file should have been renamed away");
+    }
+
+    /// Stopping a run takes the half-finished file with it.
+    ///
+    /// The episode comes down over about a second and a half, and the run is
+    /// stopped while it is still arriving — so there is a real `.part` file,
+    /// with real bytes in it, open on a real socket at the moment the user says
+    /// stop. What the sweep has to leave behind is nothing at all.
+    ///
+    /// The timings come from `DRIBBLE_CHUNKS` and `DRIBBLE_GAP`. The speed probe
+    /// reads the same slow route first and gives up at `PROBE_TIME`, so the
+    /// download cannot start before ~1.5s, and at a tenth of a second per piece
+    /// it cannot finish before ~4s. Stopping at 2.5s therefore lands about a
+    /// second into the transfer with a second and a half to spare after it —
+    /// margins a slow machine only widens, since every wait here is the server
+    /// sleeping rather than the client working.
+    #[test]
+    fn stopping_a_run_sweeps_up_the_file_it_was_part_way_through() {
+        let base = start_server();
+        let dir = TempDir::new("sweep-inflight");
+        let mut settings = settings_for(&dir.0, &base, true);
+        settings.subscriptions = vec![opml::Subscription {
+            title: "My Show".into(),
+            url: format!("{base}/dribble.xml"),
+        }];
+        let show = settings.out_dir.join("My Show");
+
+        let updates =
+            run_engine_cancelling_after(settings, Some(Duration::from_millis(2500)));
+
+        assert!(matches!(
+            updates.last(),
+            Some(Update::Finished { cancelled: true })
+        ));
+        // Stopped mid-transfer, so this is a sweep of something that was there.
+        assert!(
+            !show.join("050825-1000.mp3").exists(),
+            "the episode finished; this test proves nothing about the sweep"
+        );
+        // And it says so, which is also how the test knows there was a real
+        // half-written file to sweep rather than nothing to do.
+        let said: Vec<&String> = updates
+            .iter()
+            .filter_map(|u| match u {
+                Update::Log(line) if line.contains("Cleared away") => Some(line),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            said.len(),
+            1,
+            "expected one line about the sweep, got {said:?}"
+        );
+        assert!(said[0].starts_with("Cleared away 1 unfinished file ("), "{said:?}");
+        assert_eq!(
+            leftover_parts(&show),
+            Vec::<String>::new(),
+            "stopping left the half-finished file behind"
+        );
+    }
+
+    /// And a fragment left by some earlier interrupted run goes the same way,
+    /// even when this run never downloads a byte itself.
+    ///
+    /// Turning down the confirmation is stopping — the same code path, reached
+    /// with the Cancel button rather than the Stop one — so the tidy-up it
+    /// promises has to happen there too, and it has to reach the leftovers of
+    /// runs that ended before the sweep existed.
+    #[test]
+    fn a_run_turned_down_at_the_question_sweeps_up_what_was_already_there() {
+        let base = start_server();
+        let dir = TempDir::new("sweep-declined");
+        let settings = settings_for(&dir.0, &base, true);
+        let show = settings.out_dir.join("My Show");
+        std::fs::create_dir_all(&show).expect("create show dir");
+
+        // Half an episode, as an interrupted run used to leave it.
+        let part = show.join("050825-1000.mp3.part");
+        std::fs::write(&part, &media()[..40_000]).expect("write part");
+
+        // Never agreed to, and stopped shortly after the feeds are read.
+        let updates =
+            run_engine_with(settings, Some(Duration::from_millis(600)), Proceed::new());
+
+        assert!(matches!(
+            updates.last(),
+            Some(Update::Finished { cancelled: true })
+        ));
+        assert!(!part.exists(), "the fragment outlived the run that was stopped");
+    }
+
+    /// A run that ends on its own is not a run anybody stopped, and it must not
+    /// go through the folder deleting things — a `.part` file at that point
+    /// belongs to an episode that failed, and it is what the next run resumes
+    /// from.
+    #[test]
+    fn a_run_that_finishes_leaves_a_fragment_alone_to_be_resumed() {
+        let base = start_server();
+        let dir = TempDir::new("sweep-finished");
+        let mut settings = settings_for(&dir.0, &base, true);
+        settings.subscriptions = vec![opml::Subscription {
+            title: "My Show".into(),
+            url: format!("{base}/resume.xml"),
+        }];
+        let show = settings.out_dir.join("My Show");
+        std::fs::create_dir_all(&show).expect("create show dir");
+
+        let media = media();
+        let part = show.join("050825-1000.mp3.part");
+        std::fs::write(&part, &media[..40_000]).expect("write part");
+
+        run_engine(settings);
+
+        // Resumed and renamed into place rather than deleted, which is the same
+        // thing `resumes_a_part_file_instead_of_starting_over` asserts — said
+        // again here because the sweep is what would break it.
+        assert_is_the_episode(&show.join("050825-1000.mp3"));
+        assert!(!part.exists());
+    }
+
+    #[test]
+    fn a_part_file_keeps_the_extension_it_will_end_up_with() {
+        assert_eq!(
+            part_path(Path::new("/tmp/show/050825-1000.mp3")),
+            PathBuf::from("/tmp/show/050825-1000.mp3.part")
+        );
+        // A file with no extension still gets one, and picks up nothing else.
+        assert_eq!(
+            part_path(Path::new("/tmp/show/episode")),
+            PathBuf::from("/tmp/show/episode.part")
+        );
+    }
+
+    /// Everything in `dir` that is still only part of an episode.
+    fn leftover_parts(dir: &Path) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".part"))
+            .collect();
+        names.sort();
+        names
     }
 
     #[test]
