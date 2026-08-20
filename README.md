@@ -2,10 +2,18 @@
 
 Point it at the OPML file your podcast app exports and it downloads the
 episodes, giving every podcast a folder of its own under `~/Podbatch/Downloads`.
+Tick a whole subscription, or open it up and pick out the episodes you want.
+
+Then, if you want them as words rather than audio, it will transcribe them:
+Whisper does the listening, the speakers are marked as they change, and each
+transcript is written beside its episode as a Word document, a PDF or plain
+text. That part leans on programs it does not ship, and the app offers to
+install them — after showing you exactly what it is about to run.
 
 It is a desktop app rather than a script because choosing which of forty
-subscriptions to fetch, and watching sixty large files come down over a slow
-connection, are both things a window does better than a terminal.
+subscriptions to fetch, watching sixty large files come down over a slow
+connection, and picking through what came back are all things a window does
+better than a terminal.
 
 ## The window
 
@@ -264,9 +272,15 @@ files are created `0600` and the folder `0700` — and a log left behind by an
 earlier version is tightened on the next launch rather than left as it was
 found, since that is the one with the history in it.
 
-That last point is worth knowing if you have run a version before 1.5.3: the
-permissions are fixed automatically, but URLs already written stay written.
-Delete `~/Podbatch/Logging` if you would rather start clean.
+If you ran a version before 1.5.3, there is one thing to do by hand. The
+permissions are put right on the next launch, but URLs already written stay
+written — redaction only applies to new lines. Only `debug.log` ever carried
+them, so deleting that one file and its `.old` is enough, and it leaves the
+`output.log` history intact:
+
+```sh
+rm -f ~/Podbatch/Logging/debug.log ~/Podbatch/Logging/debug.log.old
+```
 
 ## Running it
 
