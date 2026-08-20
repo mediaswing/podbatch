@@ -134,6 +134,82 @@ pub fn extension_for(url: &str, mime: Option<&str>) -> String {
     }
 }
 
+/// Whether a URL is one we will fetch at all.
+///
+/// An allowlist of the two schemes that mean "download this over the network".
+/// A subscription list is a file from outside, and so is every feed it names;
+/// neither gets to hand us a `file://` to read back or anything else the HTTP
+/// client might one day learn to open.
+pub fn looks_like_http(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+/// The length past which a path segment is treated as a secret rather than a
+/// name. Long enough to leave `episodes`, `download` and a numeric id alone;
+/// short enough to catch a token.
+const SECRET_SEGMENT: usize = 20;
+
+/// A URL with the parts that are credentials taken out, for the logs.
+///
+/// Private podcast feeds — Patreon, Supporting Cast, most paid networks — carry
+/// a bearer token in the URL and nothing else. The URL *is* the subscription,
+/// so a debug log full of them is a file that must never be shared, which is
+/// the opposite of what a debug log is for: the whole point of it is to be sent
+/// to somebody when a run goes wrong.
+///
+/// What survives is the part that answers "why did this fail" — the scheme, the
+/// host, and the shape of the path. What goes is the query string, anything
+/// before an `@`, and any path segment long enough to be a token rather than a
+/// word. Every URL written to a log goes through here.
+pub fn redact_url(url: &str) -> String {
+    const HIDDEN: &str = "…";
+
+    let Some((scheme, rest)) = url.split_once("://") else {
+        // Not a shape we can take apart, so there is no telling which part of
+        // it is the secret. None of it goes in the log.
+        return HIDDEN.to_string();
+    };
+
+    // The fragment and the query go first. A query string is where a token most
+    // often sits, and no part of one is worth a log line.
+    let rest = rest.split('#').next().unwrap_or(rest);
+    let (rest, had_query) = match rest.split_once('?') {
+        Some((before, _)) => (before, true),
+        None => (rest, false),
+    };
+
+    let (authority, path) = match rest.split_once('/') {
+        Some((authority, path)) => (authority, Some(path)),
+        None => (rest, None),
+    };
+
+    // `user:password@host`, which reqwest honours — a credential written in a
+    // different place, and one that has to leave with the rest.
+    let host = match authority.rsplit_once('@') {
+        Some((_, host)) => format!("{HIDDEN}@{host}"),
+        None => authority.to_string(),
+    };
+
+    let mut out = format!("{scheme}://{host}");
+    if let Some(path) = path {
+        out.push('/');
+        let kept: Vec<&str> = path
+            .split('/')
+            .map(|segment| match segment.chars().count() >= SECRET_SEGMENT {
+                true => HIDDEN,
+                false => segment,
+            })
+            .collect();
+        out.push_str(&kept.join("/"));
+    }
+    if had_query {
+        out.push('?');
+        out.push_str(HIDDEN);
+    }
+    out
+}
+
 /// When an episode was published, in UTC and to the minute.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Published {
@@ -513,6 +589,63 @@ mod tests {
         // device — "Console" must be left exactly as it was written.
         assert_eq!(sanitize("Console"), "Console");
         assert_eq!(sanitize("Nullable Podcast"), "Nullable Podcast");
+    }
+
+    /// A feed URL is a credential often enough that the log must assume it is
+    /// one. This is the test that says which parts of it survive.
+    #[test]
+    fn redaction_keeps_the_host_and_drops_the_secret() {
+        // An ordinary public feed is left entirely readable — the log is still
+        // meant to be useful.
+        assert_eq!(
+            redact_url("https://feeds.megaphone.fm/show.xml"),
+            "https://feeds.megaphone.fm/show.xml"
+        );
+
+        // A query string is where a token usually is, and none of it is kept.
+        assert_eq!(
+            redact_url("https://www.patreon.com/rss/12345?auth=s3cr3t-token-value"),
+            "https://www.patreon.com/rss/12345?…"
+        );
+
+        // A token in the path instead, which is the other convention.
+        assert_eq!(
+            redact_url("https://example.com/feed/0123456789abcdef0123/rss.xml"),
+            "https://example.com/feed/…/rss.xml"
+        );
+
+        // Credentials in the authority, which reqwest would have honoured.
+        assert_eq!(
+            redact_url("https://user:password@example.com/f.xml"),
+            "https://…@example.com/f.xml"
+        );
+
+        // A fragment is not kept either, and something we cannot take apart is
+        // not guessed at.
+        assert_eq!(redact_url("https://a.test/f.xml#part"), "https://a.test/f.xml");
+        assert_eq!(redact_url("not a url at all"), "…");
+
+        // Whatever comes out, none of the secret is still in it.
+        for url in [
+            "https://www.patreon.com/rss/12345?auth=s3cr3t-token-value",
+            "https://example.com/feed/0123456789abcdef0123/rss.xml",
+            "https://user:password@example.com/f.xml",
+        ] {
+            let out = redact_url(url);
+            for secret in ["s3cr3t", "0123456789abcdef0123", "password"] {
+                assert!(!out.contains(secret), "{secret} survived into {out}");
+            }
+        }
+    }
+
+    #[test]
+    fn only_http_urls_are_ever_fetched() {
+        assert!(looks_like_http("http://a.test/f"));
+        assert!(looks_like_http("HTTPS://a.test/f"));
+        assert!(!looks_like_http("file:///etc/passwd"));
+        assert!(!looks_like_http("itpc://a.test/f"));
+        assert!(!looks_like_http("data:text/xml,<rss/>"));
+        assert!(!looks_like_http(""));
     }
 
     #[test]

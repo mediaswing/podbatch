@@ -2869,6 +2869,7 @@ dependencies = [
  "id3",
  "reqwest",
  "rfd",
+ "ring",
  "rodio",
  "roxmltree",
  "rustls",

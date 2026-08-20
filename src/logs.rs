@@ -95,6 +95,7 @@ fn open_in(dir: &Path) -> Result<PathBuf, String> {
 
 fn start(dir: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    private(dir);
 
     let debug = append_to(&dir.join("debug.log"))?;
     let output = append_to(&dir.join("output.log"))?;
@@ -132,14 +133,53 @@ fn append_to(path: &Path) -> Result<File, String> {
         // One generation back is kept. Two runs' worth of history is enough to
         // compare a run that worked against the one that didn't, and this way
         // the folder can never hold more than a handful of megabytes.
-        let _ = std::fs::rename(path, path.with_extension("log.old"));
+        let old = path.with_extension("log.old");
+        let _ = std::fs::rename(path, &old);
+        private(&old);
     }
 
-    OpenOptions::new()
-        .create(true)
-        .append(true)
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+
+    let file = options
         .open(path)
-        .map_err(|e| format!("{}: {e}", path.display()))
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+
+    // `mode` above only applies to a file this call creates. A log written by
+    // an earlier version is already sitting there at whatever the umask gave
+    // it, and that is the one with the history in it — so it is tightened here
+    // rather than left as it was found.
+    private(path);
+    Ok(file)
+}
+
+/// Keep a log, or the folder holding them, to the user who owns it.
+///
+/// These files record every URL a run touched. Feed URLs are bearer tokens
+/// often enough — a private Patreon or Supporting Cast feed is nothing but a
+/// token — that even redacted they are not something to leave world-readable on
+/// a machine with more than one account on it. [`crate::util::redact_url`] is
+/// the other half of this: one keeps the secret out of the file, the other
+/// keeps the file to its owner.
+///
+/// A no-op away from Unix, where the home directory is already per-user and
+/// there is no mode to set.
+fn private(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = if path.is_dir() { 0o700 } else { 0o600 };
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
 }
 
 /// A line for `debug.log`: how the program got where it is.
@@ -245,6 +285,47 @@ mod tests {
             .map(|o| o.tag().len())
             .collect();
         assert!(widths.iter().all(|&w| w == widths[0]), "{widths:?}");
+    }
+
+    /// A log holds every URL a run touched, and a private feed URL is a
+    /// password. Both files, and the folder over them, are the owner's alone —
+    /// including a log that was already there from a version that didn't do
+    /// this, which is the one with the history in it.
+    #[test]
+    #[cfg(unix)]
+    fn the_logs_are_readable_only_by_the_user() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("podbatch-log-modes-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        // One left behind by an earlier version, world-readable.
+        let stale = dir.join("debug.log");
+        std::fs::write(&stale, b"https://www.patreon.com/rss/1?auth=secret\n").expect("write");
+        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        let mode_of = |p: &Path| {
+            std::fs::metadata(p).expect("metadata").permissions().mode() & 0o777
+        };
+
+        let file = append_to(&stale).expect("open");
+        drop(file);
+        assert_eq!(mode_of(&stale), 0o600, "an existing log was left world-readable");
+
+        // And one this call creates from nothing.
+        let fresh = dir.join("output.log");
+        let file = append_to(&fresh).expect("open");
+        drop(file);
+        assert_eq!(mode_of(&fresh), 0o600);
+
+        private(&dir);
+        assert_eq!(mode_of(&dir), 0o700, "the folder over them is still open");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The rotation, the folder creation and the two handles, on a folder of

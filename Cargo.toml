@@ -22,6 +22,11 @@ reqwest = { version = "0.13.4", default-features = false, features = ["stream", 
 # has to be chosen and installed before the first HTTPS request; this is the
 # same crate and version reqwest already links, so it compiles no extra code.
 rustls = { version = "0.23.43", default-features = false, features = ["ring"] }
+# Only for one SHA-256: the Whisper model is checked against a pinned hash
+# before it is put in place. Not a new thing to build — rustls above already
+# links ring, so this names a crate the tree was compiling anyway rather than
+# adding a second hashing implementation to audit.
+ring = "0.17.14"
 roxmltree = "0.21.1"
 # Only for the two end-of-run cues, which are WAV — no other format is needed.
 rodio = { version = "0.22.2", default-features = false, features = ["playback", "wav"] }

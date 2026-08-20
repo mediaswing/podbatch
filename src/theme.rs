@@ -234,6 +234,16 @@ pub fn apply(ctx: &egui::Context) {
         // egui's default is 60% alpha, which drops supporting text below 4.5:1
         // on both themes. Weak text here is a shade, not a whisper.
         style.visuals.weak_text_alpha = 0.85;
+
+        // And the same argument for anything switched off. egui's default of
+        // 0.5 takes a podcast title on the light theme from 16.8:1 down to
+        // 3.4:1 — under the 4.5:1 floor — and every title in the list is
+        // switched off for as long as a run lasts, because the title is its
+        // tick box's label. That is precisely the stretch during which somebody
+        // is reading the list to see where the run has got to. At 0.75 the same
+        // title measures 7.7:1 on the light theme and 9.4:1 on the dark, and it
+        // still reads as plainly unavailable.
+        style.visuals.disabled_alpha = 0.75;
     });
 }
 
@@ -271,4 +281,118 @@ pub fn percentage_across(ui: &egui::Ui, bar: egui::Rect, progress: f32) {
         font,
         PROGRESS_TEXT,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// WCAG's relative luminance, and the contrast between two opaque colours.
+    fn contrast(a: Color32, b: Color32) -> f32 {
+        fn channel(value: u8) -> f32 {
+            let value = value as f32 / 255.0;
+            if value <= 0.03928 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        fn luminance(c: Color32) -> f32 {
+            0.2126 * channel(c.r()) + 0.7152 * channel(c.g()) + 0.0722 * channel(c.b())
+        }
+        let (a, b) = (luminance(a), luminance(b));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    /// What a colour becomes when egui fades it for a switched-off widget.
+    fn faded(fg: Color32, bg: Color32, alpha: f32) -> Color32 {
+        let mix = |f: u8, b: u8| (alpha * f as f32 + (1.0 - alpha) * b as f32).round() as u8;
+        Color32::from_rgb(mix(fg.r(), bg.r()), mix(fg.g(), bg.g()), mix(fg.b(), bg.b()))
+    }
+
+    /// The claim at the top of this module, checked rather than asserted in
+    /// prose: every colour that carries meaning is legible on every surface it
+    /// is drawn on, in both themes.
+    #[test]
+    fn every_palette_colour_clears_the_contrast_floor() {
+        let cases: [(&str, Palette, Color32, &[Color32]); 2] = [
+            (
+                "light",
+                LIGHT,
+                Color32::from_rgb(18, 22, 28),
+                &[
+                    Color32::WHITE,
+                    Color32::from_rgb(244, 246, 249),
+                    Color32::from_rgb(236, 239, 243),
+                ],
+            ),
+            (
+                "dark",
+                DARK,
+                Color32::from_rgb(240, 244, 249),
+                &[
+                    Color32::from_rgb(20, 24, 31),
+                    Color32::from_rgb(28, 33, 41),
+                    Color32::from_rgb(13, 16, 21),
+                    Color32::from_rgb(32, 38, 47),
+                    Color32::from_rgb(38, 45, 55),
+                ],
+            ),
+        ];
+
+        for (theme, palette, text, surfaces) in cases {
+            let colours = [
+                ("ok", palette.ok),
+                ("warn", palette.warn),
+                ("bad", palette.bad),
+                ("muted", palette.muted),
+                ("accent", palette.accent),
+                ("text", text),
+            ];
+            for (name, colour) in colours {
+                for surface in surfaces {
+                    let ratio = contrast(colour, *surface);
+                    assert!(
+                        ratio >= 4.5,
+                        "{theme} {name} is {ratio:.2}:1 on {surface:?}, under the 4.5:1 floor"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A run switches every podcast's tick box off, and the podcast's name is
+    /// that tick box's label — so the whole list is drawn faded for as long as
+    /// the run lasts. egui's own default for that fade puts the light theme
+    /// under the floor; this is the value that keeps it over.
+    #[test]
+    fn a_switched_off_row_is_still_readable() {
+        let ctx = egui::Context::default();
+        apply(&ctx);
+        let alpha = ctx.style_of(Theme::Light).visuals.disabled_alpha;
+        assert_eq!(alpha, ctx.style_of(Theme::Dark).visuals.disabled_alpha);
+
+        for (theme, text, panel) in [
+            ("light", Color32::from_rgb(18, 22, 28), Color32::from_rgb(244, 246, 249)),
+            ("dark", Color32::from_rgb(240, 244, 249), Color32::from_rgb(20, 24, 31)),
+        ] {
+            let ratio = contrast(faded(text, panel, alpha), panel);
+            assert!(
+                ratio >= 4.5,
+                "{theme} titles are {ratio:.2}:1 while a run is going, under the 4.5:1 floor"
+            );
+        }
+
+        // And egui's default is genuinely the thing being corrected, so this
+        // test fails for the right reason if the override is ever dropped.
+        let ratio = contrast(
+            faded(
+                Color32::from_rgb(18, 22, 28),
+                Color32::from_rgb(244, 246, 249),
+                0.5,
+            ),
+            Color32::from_rgb(244, 246, 249),
+        );
+        assert!(ratio < 4.5, "egui's default no longer needs overriding");
+    }
 }

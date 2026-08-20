@@ -627,6 +627,7 @@ impl PodBatchApp {
     /// lines that say what actually happened, and leaves three copies of a
     /// transcript on disk where the user asked for one.
     fn show(&mut self, kind: OutputKind, text: String) {
+        let text = marked(kind, text);
         self.output.push(OutputLine { text, kind });
         if self.output.len() > OUTPUT_LIMIT {
             let excess = self.output.len() - OUTPUT_LIMIT;
@@ -1547,7 +1548,7 @@ impl PodBatchApp {
                         .min_size(egui::vec2(240.0, CONTROL_HEIGHT)),
                 );
                 if wanted == 0 {
-                    response.on_hover_text("Nothing is ticked — tick an episode, or Stop.");
+                    response.on_disabled_hover_text("Nothing is ticked — tick an episode, or Stop.");
                 } else if response.clicked() {
                     self.go_ahead();
                 }
@@ -1578,7 +1579,8 @@ impl PodBatchApp {
                         .min_size(egui::vec2(200.0, CONTROL_HEIGHT)),
                 );
                 if !ready {
-                    response.on_hover_text("Choose an OPML file and tick at least one podcast.");
+                    response
+                        .on_disabled_hover_text("Choose an OPML file and tick at least one podcast.");
                 } else if response.clicked() {
                     self.start();
                 }
@@ -2071,12 +2073,12 @@ impl PodBatchApp {
                 self.say(OutputKind::Plain, format!("Running: {display}"));
                 Some(Ok((program, args)))
             }
-            tools::Install::Download { url, to, bytes } => {
+            tools::Install::Download { url, to, bytes, sha256 } => {
                 self.say(
                     OutputKind::Plain,
                     format!("Downloading {} ({})", tool.label(), human_bytes(bytes)),
                 );
-                Some(Err((url, to)))
+                Some(Err((url, to, sha256)))
             }
             tools::Install::Guided { .. } | tools::Install::Manual { .. } => None,
         };
@@ -2097,9 +2099,10 @@ impl PodBatchApp {
                         let send_line = |line: String| send(InstallUpdate::Line(line));
                         tools::install(&program, &args, send_line)
                     }
-                    Err((url, to)) => tools::download(
+                    Err((url, to, sha256)) => tools::download(
                         &url,
                         &to,
+                        sha256.as_deref(),
                         |done, total| send(InstallUpdate::Progress { done, total }),
                         || cancel.is_cancelled(),
                     ),
@@ -2280,11 +2283,11 @@ impl PodBatchApp {
                         .min_size(egui::vec2(200.0, CONTROL_HEIGHT)),
                 );
                 if !self.can_transcribe() {
-                    response.on_hover_text(
+                    response.on_disabled_hover_text(
                         "Install what's needed first — the list is under the episodes.",
                     );
                 } else if !ready {
-                    response.on_hover_text("Choose a folder and tick at least one episode.");
+                    response.on_disabled_hover_text("Choose a folder and tick at least one episode.");
                 } else if response.clicked() {
                     self.ask_transcribe();
                 }
@@ -2927,7 +2930,12 @@ fn feed_row(
     if open {
         state.set_open(true);
     }
-    state
+
+    // Taken before the closures below borrow the row, for the arrow's name.
+    let title = feed.title.clone();
+    let episodes = feed.episodes.len();
+
+    let (toggle, _, _) = state
         .show_header(ui, |ui| feed_header(ui, feed, palette, busy))
         .body(|ui| {
             for episode in &mut feed.episodes {
@@ -2936,6 +2944,19 @@ fn feed_row(
                 episode_row(ui, episode, palette, picking && feed.selected);
             }
         });
+
+    // The arrow has to say what it opens. `CollapsingState::show_header` is the
+    // low-level half of the collapsing API and sets no accessibility
+    // information of its own — only the whole-widget `CollapsingHeader` does —
+    // so without this a screen reader announces an unnamed button once per
+    // podcast, which is the same failure the tick boxes take care to avoid.
+    toggle.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::CollapsingHeader,
+            true,
+            format!("{title}, {}", count(episodes, "episode")),
+        )
+    });
 }
 
 /// A podcast's own row: the tick box, named after the podcast, and whatever the
@@ -3130,6 +3151,28 @@ fn plan_lines(plan: &Plan, speed: Option<Speed>, concurrency: usize) -> Vec<Stri
     }
 
     lines
+}
+
+/// Give a line the mark its colour implies, unless it already carries one.
+///
+/// Red is the only colour here that means something a reader must not miss, and
+/// it is the only one that carries information nothing else on the line does.
+/// Most failures are written with [`MARK_FAILED`] in front of them already, but
+/// several — a feed that could not be read, an install that would not run —
+/// were red and nothing more, which leaves anybody who cannot pick the colour
+/// out reading an error as an ordinary line.
+///
+/// Only red. A tick in front of every green line would be noise, and the green
+/// lines that matter already have one.
+fn marked(kind: OutputKind, text: String) -> String {
+    let already = [MARK_DONE, MARK_SKIPPED, MARK_FAILED]
+        .iter()
+        .any(|mark| text.starts_with(mark));
+
+    match kind {
+        OutputKind::Bad if !already => format!("{MARK_FAILED} {text}"),
+        _ => text,
+    }
 }
 
 /// `1 episode`, `4 episodes`.
@@ -3662,6 +3705,33 @@ mod tests {
         assert!(
             app.downloads_began.is_some(),
             "the clock the next estimate is built on starts here"
+        );
+    }
+
+    /// Colour is the one thing on a line that some readers cannot see, so it
+    /// must never be the only thing saying an error is an error.
+    #[test]
+    fn every_failure_carries_a_mark_and_never_two() {
+        let mut app = test_app();
+
+        // A failure written without one — a feed that could not be read, an
+        // install that would not start — is given it.
+        app.say(OutputKind::Bad, "a.test/feed: could not connect".into());
+        let line = &app.output.last().expect("a line").text;
+        assert!(line.starts_with(MARK_FAILED), "{line}");
+
+        // One that already says so keeps exactly the one mark it had.
+        app.say(OutputKind::Bad, format!("{MARK_FAILED} Show — Ep: gone"));
+        let line = &app.output.last().expect("a line").text;
+        assert_eq!(line.matches(MARK_FAILED).count(), 1, "{line}");
+
+        // And nothing else grows one it did not ask for.
+        app.say(OutputKind::Plain, "Reading feeds".into());
+        assert_eq!(app.output.last().expect("a line").text, "Reading feeds");
+        app.say(OutputKind::Muted, "Logging to somewhere".into());
+        assert_eq!(
+            app.output.last().expect("a line").text,
+            "Logging to somewhere"
         );
     }
 

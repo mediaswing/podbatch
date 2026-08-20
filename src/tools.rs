@@ -28,6 +28,15 @@ pub const MODEL_FILE: &str = "ggml-small.en-tdrz.bin";
 /// after. Checked against the real file by `tests::the_model_size_is_honest`,
 /// which is ignored by default because it hits the network.
 pub const MODEL_BYTES: u64 = 487_614_184;
+/// What the model hashes to, as huggingface publishes it — both in its API and
+/// in the `x-linked-etag` of the very URL above.
+///
+/// Checked before the file is put in place. The size check in [`probe`] catches
+/// a transfer that stopped half way; this catches one that arrived complete and
+/// is not the model — a hijacked mirror, a poisoned cache, anything that got
+/// between us and huggingface. Half a gigabyte fetched over the network and
+/// then handed to a program to load is exactly the thing worth being sure of.
+pub const MODEL_SHA256: &str = "ceac3ec06d1d98ef71aec665283564631055fd6129b79d8e1be4f9cc33cc54b4";
 
 /// The Ollama model used to turn detected speaker *turns* into stable speaker
 /// *identities*. Small on purpose: it is doing bookkeeping over text, not
@@ -207,8 +216,14 @@ pub enum Install {
         /// command that actually runs.
         display: String,
     },
-    /// A file to fetch. Size is known up front so the box can quote it.
-    Download { url: String, to: PathBuf, bytes: u64 },
+    /// A file to fetch. Size is known up front so the box can quote it, and the
+    /// hash so that what lands can be checked against what was meant.
+    Download {
+        url: String,
+        to: PathBuf,
+        bytes: u64,
+        sha256: Option<String>,
+    },
     /// Needs a terminal — a password, or a prompt only a human can answer. We
     /// show it rather than run it.
     Guided { command: String, why: String },
@@ -246,6 +261,22 @@ pub fn find_program(name: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// An absolute path to run `name` by, or `name` itself if it cannot be found.
+///
+/// Every program this module executes goes through here first. `Command::new`
+/// with a bare name hands the lookup to the platform, and on Windows
+/// `CreateProcess` searches the current directory *before* `PATH` — so an app
+/// opened from a folder somebody else can write to would run their `winget.exe`
+/// while the confirmation box truthfully displayed the real command. Resolving
+/// through [`find_program`] first means the lookup only ever walks `PATH` and
+/// the known prefixes, and the current directory is never one of them.
+///
+/// Falling back to the bare name when nothing is found keeps a machine whose
+/// layout we don't recognise working exactly as it did before.
+fn resolved(name: &str) -> PathBuf {
+    find_program(name).unwrap_or_else(|| PathBuf::from(name))
 }
 
 /// The prefixes a windowed process is most likely to be missing. Apple Silicon
@@ -387,7 +418,7 @@ fn has_ollama_model(model: &str) -> bool {
 /// Deliberately a blocking call with a short timeout: it runs on the UI thread
 /// during a survey, and a machine with no Ollama must not cost a visible pause.
 fn ollama_tags() -> Option<String> {
-    let response = std::process::Command::new("curl")
+    let response = std::process::Command::new(resolved("curl"))
         .args([
             "-s",
             "--max-time",
@@ -435,6 +466,7 @@ pub fn plan(tool: Tool, manager: Option<Manager>) -> Install {
             url: MODEL_URL.to_string(),
             to: model_path(),
             bytes: MODEL_BYTES,
+            sha256: Some(MODEL_SHA256.to_string()),
         },
         Tool::OllamaModel => Install::Run {
             program: find_program("ollama")
@@ -480,7 +512,14 @@ fn package_install(manager: Manager, tool: Tool) -> Install {
         };
     }
 
-    Install::Run { program, args, display }
+    // `display` keeps the bare name, because that is the command the user knows
+    // and the one they are being shown; what actually runs is the absolute path
+    // it resolves to. See [`resolved`].
+    Install::Run {
+        program: resolved(&program).display().to_string(),
+        args,
+        display,
+    }
 }
 
 /// The two things no package manager we drive will install for us.
@@ -633,6 +672,7 @@ fn pump<R: std::io::Read + Send + 'static>(
 pub fn download(
     url: &str,
     to: &Path,
+    expected: Option<&str>,
     mut on_progress: impl FnMut(u64, Option<u64>),
     cancelled: impl Fn() -> bool,
 ) -> Result<(), String> {
@@ -693,30 +733,88 @@ pub fn download(
         std::fs::remove_file(&part).ok();
     })?;
 
+    // Checked while it is still a `.part`, so a file that is not what was asked
+    // for never gets the real name even for a moment — and is deleted rather
+    // than left for the next run to find and trust.
+    if let Some(expected) = expected {
+        let actual = sha256_of(&part).map_err(|e| {
+            std::fs::remove_file(&part).ok();
+            format!("Could not check what was downloaded — {e}")
+        })?;
+        if !actual.eq_ignore_ascii_case(expected) {
+            std::fs::remove_file(&part).ok();
+            logs::debug(format!("{url}: expected sha256 {expected}, got {actual}"));
+            return Err(
+                "What came back is not the file it should be, so it has been thrown away. \
+                 Try again — and if it keeps happening, something is interfering with the \
+                 download."
+                    .to_string(),
+            );
+        }
+        logs::debug(format!("{}: sha256 {actual} as expected", to.display()));
+    }
+
     std::fs::rename(&part, to).map_err(|e| format!("Could not put the file in place — {e}"))
+}
+
+/// The SHA-256 of a file, as lowercase hex.
+///
+/// Read in chunks rather than at once: the one thing this is used on is half a
+/// gigabyte, and loading that into memory to hash it would be a bigger cost
+/// than the download.
+fn sha256_of(path: &Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        context.update(&buffer[..read]);
+    }
+
+    Ok(context
+        .finish()
+        .as_ref()
+        .iter()
+        .fold(String::with_capacity(64), |mut out, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(out, "{byte:02x}");
+            out
+        }))
 }
 
 /// Open a terminal with the command already on the clipboard's behalf — or, on
 /// platforms where that is not something we can do cleanly, just the terminal.
 pub fn open_terminal() -> Result<(), String> {
     let result = if cfg!(target_os = "macos") {
-        Command::new("open").args(["-a", "Terminal"]).spawn()
+        Command::new(resolved("open")).args(["-a", "Terminal"]).spawn()
     } else if cfg!(windows) {
-        Command::new("cmd").args(["/c", "start", "cmd"]).spawn()
+        Command::new(resolved("cmd")).args(["/c", "start", "cmd"]).spawn()
     } else {
-        Command::new("x-terminal-emulator").spawn()
+        Command::new(resolved("x-terminal-emulator")).spawn()
     };
     result.map(|_| ()).map_err(|e| format!("Could not open a terminal — {e}"))
 }
 
 /// Open a page in whatever the user browses with.
 pub fn open_url(url: &str) -> Result<(), String> {
+    // Only ever one of the fixed pages in `unpackaged`, never anything a feed
+    // supplied — but held to the same allowlist regardless, because `cmd /c
+    // start` below would treat plenty of other strings as something to run.
+    if !crate::util::looks_like_http(url) {
+        return Err(format!("Not a web address: {url}"));
+    }
+
     let result = if cfg!(target_os = "macos") {
-        Command::new("open").arg(url).spawn()
+        Command::new(resolved("open")).arg(url).spawn()
     } else if cfg!(windows) {
-        Command::new("cmd").args(["/c", "start", "", url]).spawn()
+        Command::new(resolved("cmd")).args(["/c", "start", "", url]).spawn()
     } else {
-        Command::new("xdg-open").arg(url).spawn()
+        Command::new(resolved("xdg-open")).arg(url).spawn()
     };
     result.map(|_| ()).map_err(|e| format!("Could not open {url} — {e}"))
 }
@@ -825,6 +923,74 @@ mod tests {
     #[test]
     fn a_program_that_cannot_exist_is_not_found() {
         assert_eq!(find_program("podbatch-no-such-program-xyzzy"), None);
+    }
+
+    /// A program is run by an absolute path wherever one can be found. On
+    /// Windows a bare name lets `CreateProcess` look in the current directory
+    /// first, which is somebody else's chance to be the thing that runs.
+    #[test]
+    fn programs_are_run_by_path_rather_than_by_name() {
+        let Install::Run { program, display, .. } = plan(Tool::Ffmpeg, Some(Manager::Homebrew))
+        else {
+            panic!("expected a runnable install");
+        };
+
+        // What the user is shown stays the command they would type.
+        assert_eq!(display, "brew install ffmpeg");
+
+        // What actually runs is resolved, when this machine has it to resolve.
+        match find_program("brew") {
+            Some(path) => assert_eq!(program, path.display().to_string()),
+            None => assert_eq!(program, "brew", "nothing to resolve to, so unchanged"),
+        }
+
+        // And a name that cannot be found falls back rather than failing.
+        assert_eq!(
+            resolved("podbatch-no-such-program-xyzzy"),
+            PathBuf::from("podbatch-no-such-program-xyzzy")
+        );
+    }
+
+    /// The hash the model is checked against, on a vector anybody can verify.
+    #[test]
+    fn sha256_matches_a_known_answer() {
+        let dir = std::env::temp_dir().join(format!("podbatch-sha-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("abc");
+        std::fs::write(&path, b"abc").expect("write");
+
+        assert_eq!(
+            sha256_of(&path).expect("hash"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+
+        // Bigger than the read buffer, so the chunked loop is what is tested
+        // rather than a single read that happened to cover the file.
+        let big = dir.join("big");
+        std::fs::write(&big, vec![0u8; 200_000]).expect("write");
+        assert_eq!(sha256_of(&big).expect("hash").len(), 64);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The model download is pinned to a hash, not just to a length. A file of
+    /// the right size that is not the model must not be loadable.
+    #[test]
+    fn the_model_is_pinned_to_a_hash() {
+        let Install::Download { sha256, bytes, .. } = plan(Tool::WhisperModel, None) else {
+            panic!("expected a download");
+        };
+        assert_eq!(sha256.as_deref(), Some(MODEL_SHA256));
+        assert_eq!(bytes, MODEL_BYTES);
+        assert_eq!(MODEL_SHA256.len(), 64);
+        assert!(MODEL_SHA256.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// `cmd /c start` will happily act on things that are not web addresses.
+    #[test]
+    fn only_web_addresses_are_opened() {
+        assert!(open_url("file:///etc/passwd").is_err());
+        assert!(open_url("calculator.exe").is_err());
     }
 
     /// Hits the network, so it is not part of the ordinary run. Run it with

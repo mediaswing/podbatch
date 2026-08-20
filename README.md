@@ -253,6 +253,21 @@ The window says where the logs are going in its first line of output, and says
 so plainly if they couldn't be opened — a read-only home directory costs you the
 logs, and nothing else.
 
+**URLs in the logs are redacted, and the files are yours alone.** A private
+podcast feed — Patreon, Supporting Cast, most paid networks — is a URL with a
+token in it and nothing else, so the URL *is* the subscription. What goes in the
+log is the scheme, the host and the shape of the path; the query string,
+anything before an `@`, and any path segment long enough to be a token are
+replaced with `…`. The podcast's own title sits next to it, which is what
+identifies a feed when reading the log back anyway. On macOS and Linux both
+files are created `0600` and the folder `0700` — and a log left behind by an
+earlier version is tightened on the next launch rather than left as it was
+found, since that is the one with the history in it.
+
+That last point is worth knowing if you have run a version before 1.5.3: the
+permissions are fixed automatically, but URLs already written stay written.
+Delete `~/Podbatch/Logging` if you would rather start clean.
+
 ## Running it
 
 ```sh

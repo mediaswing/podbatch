@@ -117,7 +117,10 @@ fn enclosure(item: &roxmltree::Node) -> Option<(String, Option<u64>, Option<Stri
         }
 
         let url = attr(&child, url_attr)?.trim();
-        if url.is_empty() {
+        // The same allowlist the subscription list is held to. A feed is a file
+        // from outside, and an enclosure that names a `file://` is asking us to
+        // read the disk and write what we find into a podcast folder.
+        if url.is_empty() || !crate::util::looks_like_http(url) {
             continue;
         }
 
@@ -246,6 +249,20 @@ mod tests {
             feed.episodes[0].published.map(|p| p.stamp()).as_deref(),
             Some("050825-1000")
         );
+    }
+
+    /// An enclosure is a URL the downloader will fetch and write to disk, so it
+    /// is held to the same two schemes the subscription list is.
+    #[test]
+    fn ignores_enclosures_that_are_not_http() {
+        let rss = r#"<rss version="2.0"><channel>
+            <item><title>Local</title><enclosure url="file:///etc/passwd" type="audio/mpeg"/></item>
+            <item><title>Data</title><enclosure url="data:audio/mpeg;base64,AAAA"/></item>
+            <item><title>Real</title><enclosure url="https://cdn.test/ok.mp3" type="audio/mpeg"/></item>
+          </channel></rss>"#;
+        let feed = parse(rss).unwrap();
+        assert_eq!(feed.episodes.len(), 1);
+        assert_eq!(feed.episodes[0].url, "https://cdn.test/ok.mp3");
     }
 
     #[test]

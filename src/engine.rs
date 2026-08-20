@@ -681,7 +681,14 @@ async fn plan_feed(
 
     ctx.send(Update::FeedStatus { feed: index, status: FeedStatus::Fetching });
 
-    logs::debug(format!("feed {index} \"{}\": fetching {}", sub.title, sub.url));
+    // Redacted, like every other URL that reaches a log: a private feed's URL
+    // is the whole of its subscription. The title beside it is what actually
+    // identifies the feed when reading the log back.
+    logs::debug(format!(
+        "feed {index} \"{}\": fetching {}",
+        sub.title,
+        util::redact_url(&sub.url)
+    ));
 
     let body = match fetch_feed(&ctx, &sub.url).await {
         Ok(body) => body,
@@ -931,7 +938,10 @@ async fn fetch_feed(ctx: &Ctx, url: &str) -> Result<String, String> {
         match result {
             Ok(body) => return Ok(body),
             Err(e) => {
-                logs::debug(format!("{url}: attempt {attempt} of {ATTEMPTS} failed: {e}"));
+                logs::debug(format!(
+                    "{}: attempt {attempt} of {ATTEMPTS} failed: {e}",
+                    util::redact_url(url)
+                ));
                 last = e;
                 if attempt < ATTEMPTS {
                     tokio::time::sleep(Duration::from_millis(400 * attempt as u64)).await;
@@ -1025,7 +1035,7 @@ async fn transfer(
     logs::debug(format!(
         "{}: {} said {}{}",
         path.file_name().unwrap_or_default().to_string_lossy(),
-        episode.url,
+        util::redact_url(&episode.url),
         resp.status(),
         match (existing, resuming) {
             (0, _) => String::new(),

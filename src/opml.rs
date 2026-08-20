@@ -51,7 +51,7 @@ pub fn parse_str(text: &str) -> Result<Vec<Subscription>, OpmlError> {
             continue;
         };
         let url = url.trim();
-        if url.is_empty() || !looks_like_http(url) {
+        if url.is_empty() || !crate::util::looks_like_http(url) {
             continue;
         }
 
@@ -86,11 +86,6 @@ fn attr_ci<'a>(node: &roxmltree::Node<'a, 'a>, name: &str) -> Option<&'a str> {
     node.attributes()
         .find(|a| a.name().eq_ignore_ascii_case(name))
         .map(|a| a.value())
-}
-
-fn looks_like_http(url: &str) -> bool {
-    let lower = url.to_ascii_lowercase();
-    lower.starts_with("http://") || lower.starts_with("https://")
 }
 
 #[cfg(test)]
