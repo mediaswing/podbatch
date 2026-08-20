@@ -20,6 +20,11 @@ the width beneath both.
 Everything arrives ticked, because the usual answer is "all of them"; untick the
 few you don't want. **All** and **None** are there for when it isn't.
 
+Each podcast opens to show its own episodes, each with a tick of its own, so a
+single episode can be left out without dropping the podcast it came from. Those
+appear once the feeds have been read — see [Before it starts](#before-it-starts),
+which is the moment they can be chosen from.
+
 **Transcripts** turns episodes you already have into text. Choose a folder, tick
 the episodes, and each one is written out beside its audio.
 
@@ -101,6 +106,28 @@ actually managed replaces it, and being a whole-run figure it needs no such
 allowance. A run that could not be measured at all says so, rather than
 printing a number with nothing behind it. And when everything is already
 downloaded there is no question to ask, so none is asked.
+
+### Choosing which episodes
+
+The box has a third answer: **☑ Choose episodes…**. It is the only place the
+question "not all of them, though" can be asked — the feeds have just been read,
+so the app finally knows what each podcast contains, and not a byte of it has
+been fetched.
+
+Pressing it puts the question aside without answering it. The run stays exactly
+where it is, held with every feed read and nothing downloaded, and the pane on
+the left opens up: every podcast folds out into its episodes, each with a tick
+beside it. Untick the ones you don't want — **All** and **None** now act on the
+episodes rather than the podcasts, as does Cmd/Ctrl+A. Episodes already on disk
+are shown as **already here** and cannot be ticked; they were never part of the
+job.
+
+The button at the top then reads **▶ Download 12 episodes**, counting what is
+actually ticked, and pressing it starts the run on exactly those. Anything left
+out is reported as **left out** rather than as an episode the app happened to
+already have — the two are different answers to "why is this not here?", and
+only one of them is a decision anybody made. **Stop** is still there, and still
+asks.
 
 Answering **Cancel**, or pressing Escape, ends the run there. Nothing has been
 written: not an episode, not a `.part` file, not so much as a folder — reading

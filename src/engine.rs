@@ -12,9 +12,10 @@
 //! user can be told the size of what they just asked for before it starts —
 //! which is not something either side can know until the feeds have been read.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
@@ -69,7 +70,13 @@ pub enum EpisodeStatus {
     Pending,
     Downloading,
     Done,
+    /// Already on disk, so there was nothing to fetch.
     Skipped,
+    /// Taken out of the job by the user, who un-ticked it while the run was
+    /// held at the confirmation. Kept apart from `Skipped` because the two are
+    /// different answers to "why is this episode not here?" — one is the app
+    /// noticing it already had it, the other is a decision somebody made.
+    Unticked,
     Cancelled,
     Failed(String),
 }
@@ -175,12 +182,51 @@ impl Default for Proceed {
     }
 }
 
+/// Handle the UI keeps so it can take individual episodes back out of the job.
+///
+/// The window cannot know what is in a podcast until the feeds have been read,
+/// so per-episode choosing can only happen in the pause [`Proceed`] creates.
+/// This is what carries that choice across: the window fills it in before it
+/// says to go ahead, and the engine reads it once, on the way out of the pause.
+/// Episodes are named by the same `(feed, episode)` indices every [`Update`]
+/// uses, so both sides are talking about the same thing without either having
+/// to send the list back.
+#[derive(Clone, Default)]
+pub struct Skips(Arc<Mutex<HashSet<(usize, usize)>>>);
+
+impl Skips {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// What to leave out. Replaces whatever was there before, so the window can
+    /// simply hand over the state of its tick boxes rather than a difference.
+    pub fn set(&self, skips: HashSet<(usize, usize)>) {
+        // A poisoned lock means a thread panicked mid-write. Nothing here is
+        // load-bearing enough to bring the run down over: the worst a stale set
+        // does is download an episode the user had un-ticked.
+        if let Ok(mut held) = self.0.lock() {
+            *held = skips;
+        }
+    }
+
+    /// Whether this episode is one to leave out. `pub(crate)` so the window's
+    /// own tests can check that what the user un-ticked is what was handed
+    /// over — the wiring between the two is the whole point of this handle.
+    pub(crate) fn holds(&self, feed: usize, episode: usize) -> bool {
+        self.0
+            .lock()
+            .is_ok_and(|held| held.contains(&(feed, episode)))
+    }
+}
+
 /// Shared context passed down to each feed/episode task.
 struct Ctx {
     tx: UnboundedSender<Update>,
     notify: Arc<dyn Fn() + Send + Sync>,
     cancel: Cancel,
     proceed: Proceed,
+    skips: Skips,
     client: reqwest::Client,
     permits: Arc<Semaphore>,
     settings: Settings,
@@ -211,6 +257,7 @@ pub fn spawn(
     tx: UnboundedSender<Update>,
     cancel: Cancel,
     proceed: Proceed,
+    skips: Skips,
     notify: Arc<dyn Fn() + Send + Sync>,
 ) {
     std::thread::Builder::new()
@@ -229,7 +276,7 @@ pub fn spawn(
                     return;
                 }
             };
-            runtime.block_on(run(settings, tx, cancel, proceed, notify));
+            runtime.block_on(run(settings, tx, cancel, proceed, skips, notify));
         })
         .expect("spawn engine thread");
 }
@@ -254,6 +301,7 @@ async fn run(
     tx: UnboundedSender<Update>,
     cancel: Cancel,
     proceed: Proceed,
+    skips: Skips,
     notify: Arc<dyn Fn() + Send + Sync>,
 ) {
     install_crypto_provider();
@@ -282,6 +330,7 @@ async fn run(
         notify,
         cancel,
         proceed,
+        skips,
         client,
         permits: Arc::new(Semaphore::new(concurrency)),
         settings,
@@ -396,6 +445,12 @@ async fn run(
         return;
     }
 
+    // What the user un-ticked while the run was held. Read here and nowhere
+    // else: from this line on the episodes are in flight, and a job that could
+    // change under the transfers already running would be a job nobody — the
+    // engine, the window, or the person watching it — could describe.
+    let reads = drop_unticked(&ctx, reads);
+
     // Pass two: fetch it.
     futures_util::stream::iter(reads.into_iter().filter_map(|read| read.plan).map(|plan| {
         let ctx = Arc::clone(&ctx);
@@ -449,6 +504,51 @@ fn abandon(ctx: &Ctx, reads: &[FeedRead]) {
     for plan in reads.iter().filter_map(|r| r.plan.as_ref()) {
         ctx.send(Update::FeedStatus { feed: plan.index, status: FeedStatus::Pending });
     }
+}
+
+/// Take the episodes the user un-ticked out of the job, and say so for each one.
+///
+/// Each is announced as [`EpisodeStatus::Unticked`] rather than quietly dropped:
+/// its row is already on screen from the reading pass, and a row left saying
+/// "waiting" for something that will never be fetched is the sort of thing
+/// people sit and watch.
+///
+/// A podcast left with nothing to fetch is finished rather than downloading —
+/// and, because `download_feed` is what creates the folders, un-ticking a whole
+/// podcast's episodes now leaves no empty folder behind either.
+fn drop_unticked(ctx: &Ctx, reads: Vec<FeedRead>) -> Vec<FeedRead> {
+    reads
+        .into_iter()
+        .map(|mut read| {
+            let Some(plan) = read.plan.as_mut() else {
+                return read;
+            };
+            let feed = plan.index;
+
+            let before = plan.episodes.len();
+            plan.episodes.retain(|(episode, _, _)| {
+                let wanted = !ctx.skips.holds(feed, *episode);
+                if !wanted {
+                    ctx.send(Update::EpisodeStatus {
+                        feed,
+                        episode: *episode,
+                        status: EpisodeStatus::Unticked,
+                    });
+                }
+                wanted
+            });
+
+            let dropped = before - plan.episodes.len();
+            if dropped > 0 {
+                logs::debug(format!("feed {feed}: {dropped} episode(s) un-ticked"));
+            }
+            if plan.episodes.is_empty() {
+                ctx.send(Update::FeedStatus { feed, status: FeedStatus::Done });
+                read.plan = None;
+            }
+            read
+        })
+        .collect()
 }
 
 /// Add up what the feeds came back with, into the description of the job that
@@ -1510,12 +1610,21 @@ mod tests {
     /// confirmation is given up front, which is what a user clicking Download
     /// in the box amounts to.
     fn run_engine(settings: Settings) -> Vec<Update> {
-        run_engine_with(settings, None, agreed())
+        run_engine_with(settings, None, agreed(), Skips::new())
     }
 
     /// As above, but stopping the run after `delay`.
     fn run_engine_cancelling_after(settings: Settings, delay: Option<Duration>) -> Vec<Update> {
-        run_engine_with(settings, delay, agreed())
+        run_engine_with(settings, delay, agreed(), Skips::new())
+    }
+
+    /// As above, with some of the episodes un-ticked before the confirmation is
+    /// given — which is the state the window leaves behind when someone picks
+    /// through the list and then presses Download.
+    fn run_engine_without(settings: Settings, unticked: &[(usize, usize)]) -> Vec<Update> {
+        let skips = Skips::new();
+        skips.set(unticked.iter().copied().collect());
+        run_engine_with(settings, None, agreed(), skips)
     }
 
     /// A confirmation that has already been given.
@@ -1529,6 +1638,7 @@ mod tests {
         settings: Settings,
         cancel_after: Option<Duration>,
         proceed: Proceed,
+        skips: Skips,
     ) -> Vec<Update> {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1546,7 +1656,7 @@ mod tests {
             });
         }
 
-        runtime.block_on(run(settings, tx, cancel, proceed, Arc::new(|| {})));
+        runtime.block_on(run(settings, tx, cancel, proceed, skips, Arc::new(|| {})));
 
         let mut updates = Vec::new();
         while let Ok(update) = rx.try_recv() {
@@ -1672,6 +1782,62 @@ mod tests {
         assert_eq!(again[1].1, EpisodeStatus::Skipped);
     }
 
+    /// An episode the user un-ticked is not fetched, and the ones either side of
+    /// it still are. The whole point of picking through the list is that it is
+    /// per episode and not per podcast.
+    #[test]
+    fn an_unticked_episode_is_left_alone_and_the_rest_still_run() {
+        let base = start_server();
+        let dir = TempDir::new("unticked");
+        let settings = settings_for(&dir.0, &base, true);
+        let show = settings.out_dir.join("My Show");
+
+        // The middle of the three, which is the one with no pubDate and so the
+        // one named after its title.
+        let updates = run_engine_without(settings, &[(0, 1)]);
+
+        assert_is_the_episode(&show.join("050825-1000.mp3"));
+        assert!(
+            !show.join("Episode Two.mp3").exists(),
+            "an un-ticked episode was downloaded anyway"
+        );
+
+        assert_eq!(
+            outcomes(&updates),
+            vec![
+                ("050825-1000.mp3".to_string(), EpisodeStatus::Done),
+                ("Episode Two.mp3".to_string(), EpisodeStatus::Unticked),
+                ("Gone.mp3".to_string(), EpisodeStatus::Failed("server said 404 Not Found".into())),
+            ]
+        );
+    }
+
+    /// Un-ticking everything a podcast had is not the same as a run that fetched
+    /// it: nothing is downloaded, and — because the folders are made by the pass
+    /// that fetches — no empty folder is left sitting there either.
+    #[test]
+    fn unticking_every_episode_leaves_no_folder_behind() {
+        let base = start_server();
+        let dir = TempDir::new("unticked-all");
+        let settings = settings_for(&dir.0, &base, true);
+        let show = settings.out_dir.join("My Show");
+
+        let updates = run_engine_without(settings, &[(0, 0), (0, 1), (0, 2)]);
+
+        assert!(!show.exists(), "an empty folder was left behind");
+        assert!(
+            outcomes(&updates)
+                .iter()
+                .all(|(_, status)| *status == EpisodeStatus::Unticked),
+            "{:?}",
+            outcomes(&updates)
+        );
+        assert!(matches!(
+            updates.last(),
+            Some(Update::Finished { cancelled: false })
+        ));
+    }
+
     /// Resuming, proved rather than assumed.
     ///
     /// The episode comes from `/resume.mp3`, which serves the real bytes only
@@ -1784,7 +1950,7 @@ mod tests {
 
         // Never agreed to, and stopped shortly after the feeds are read.
         let updates =
-            run_engine_with(settings, Some(Duration::from_millis(600)), Proceed::new());
+            run_engine_with(settings, Some(Duration::from_millis(600)), Proceed::new(), Skips::new());
 
         assert!(matches!(
             updates.last(),
@@ -1924,6 +2090,7 @@ mod tests {
             settings,
             Some(Duration::from_millis(600)),
             Proceed::new(),
+            Skips::new(),
         );
 
         assert_eq!(

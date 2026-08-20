@@ -21,6 +21,7 @@
 //! through [`Dialog`], and both are asked the same way whether the button or the
 //! keyboard set them off.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -29,7 +30,9 @@ use egui::{AtomExt as _, RichText, Ui};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::document;
-use crate::engine::{self, Cancel, EpisodeStatus, FeedStatus, Plan, Proceed, Settings, Update};
+use crate::engine::{
+    self, Cancel, EpisodeStatus, FeedStatus, Plan, Proceed, Settings, Skips, Update,
+};
 use crate::logs;
 use crate::opml;
 use crate::sound::{self, Cue};
@@ -48,6 +51,12 @@ const OUTPUT_LIMIT: usize = 2000;
 /// noise rather than information; the run says the same thing in writing on the
 /// line above, so a cue that has to be dropped costs nothing.
 const CUE_GAP: Duration = Duration::from_millis(700);
+
+/// How many episodes a run can be holding before the pane stops folding every
+/// podcast open the moment picking starts. Past this it is quicker to open the
+/// two you care about than to scroll through all of them — and every row laid
+/// out is a row egui measures on every frame, on screen or not.
+const OPEN_EVERY_LIST_UNDER: usize = 200;
 
 /// The marks down the left of the output.
 ///
@@ -105,7 +114,7 @@ fn shortcuts() -> Vec<(Action, egui::KeyboardShortcut, &'static str)> {
         (
             Action::Start,
             KeyboardShortcut::new(command, Key::Enter),
-            "Start downloading",
+            "Start downloading, or start what you have ticked",
         ),
         (
             Action::Stop,
@@ -140,12 +149,12 @@ fn shortcuts() -> Vec<(Action, egui::KeyboardShortcut, &'static str)> {
         (
             Action::SelectAll,
             KeyboardShortcut::new(command, Key::A),
-            "Tick every podcast",
+            "Tick everything in the list you are looking at",
         ),
         (
             Action::SelectNone,
             KeyboardShortcut::new(command_shift, Key::A),
-            "Untick every podcast",
+            "Untick everything in the list you are looking at",
         ),
     ]
 }
@@ -195,6 +204,19 @@ impl Dialog {
             Dialog::StopTranscribing => "\"stop transcribing?\"".to_string(),
         }
     }
+}
+
+/// What a press on the dialog meant.
+///
+/// Most questions here are yes or no. The download confirmation has a third
+/// answer — "let me choose which of them" — which is neither: it leaves the
+/// question standing and the engine holding, and puts the episode lists in
+/// reach so it can be answered properly a moment later.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Answer {
+    Yes,
+    No,
+    Choose,
 }
 
 /// A file in the chosen folder, and how far its transcript has got.
@@ -252,6 +274,11 @@ struct EpisodeRow {
     /// What it is called on disk, which is what the output reports for anything
     /// that actually landed there.
     file_name: String,
+    /// Whether to fetch this one. Only worth anything in the pause between
+    /// reading the feeds and downloading them — before that there is no episode
+    /// to have an opinion about, and after it the transfers are already in
+    /// flight. See [`PodBatchApp::picking`].
+    selected: bool,
     status: EpisodeStatus,
     done: u64,
     total: Option<u64>,
@@ -261,8 +288,18 @@ impl EpisodeRow {
     fn finished(&self) -> bool {
         matches!(
             self.status,
-            EpisodeStatus::Done | EpisodeStatus::Skipped | EpisodeStatus::Failed(_)
+            EpisodeStatus::Done
+                | EpisodeStatus::Skipped
+                | EpisodeStatus::Unticked
+                | EpisodeStatus::Failed(_)
         )
+    }
+
+    /// Whether this one is still the user's to choose. Everything else has
+    /// either been fetched, been found on disk, or failed trying — none of
+    /// which a tick box can change now.
+    fn choosable(&self) -> bool {
+        matches!(self.status, EpisodeStatus::Pending)
     }
 }
 
@@ -331,6 +368,9 @@ struct Totals {
     finished: usize,
     downloaded: usize,
     skipped: usize,
+    /// Episodes the user took out of the job themselves. Counted apart from
+    /// `skipped`, which is the app's own decision about episodes it already had.
+    unticked: usize,
     failed: usize,
     bytes: u64,
 }
@@ -371,6 +411,21 @@ pub struct PodBatchApp {
     /// The engine holds between reading the feeds and downloading them; this is
     /// what releases it, once the user has agreed to the job.
     proceed: Option<Proceed>,
+    /// The episodes to leave out, handed over at the same moment.
+    skips: Option<Skips>,
+    /// Set once when picking begins, to fold every podcast's episodes open on
+    /// the next frame and never again. A one-shot rather than a state: after
+    /// that first frame, which is open and which is shut is the user's business.
+    open_episode_lists: bool,
+    /// Whether the user has asked to go through the episode list before the
+    /// downloads start.
+    ///
+    /// True only inside the pause `proceed` creates, and it is what the pause
+    /// is for: this is the one moment when the app knows what is in each
+    /// podcast and has not yet started fetching any of it. The confirmation box
+    /// steps aside while this is set, so the list underneath can be ticked
+    /// through — nothing else in the window is waiting on it.
+    picking: bool,
     rx: Option<UnboundedReceiver<Update>>,
     notify: Arc<dyn Fn() + Send + Sync>,
 
@@ -447,6 +502,9 @@ impl PodBatchApp {
             outcome: None,
             cancel: None,
             proceed: None,
+            skips: None,
+            open_episode_lists: false,
+            picking: false,
             rx: None,
             notify,
             dialog: None,
@@ -589,6 +647,7 @@ impl PodBatchApp {
                         t.bytes += ep.done;
                     }
                     EpisodeStatus::Skipped => t.skipped += 1,
+                    EpisodeStatus::Unticked => t.unticked += 1,
                     EpisodeStatus::Failed(_) => t.failed += 1,
                     _ => {}
                 }
@@ -644,6 +703,7 @@ impl PodBatchApp {
         self.output.clear();
         self.output_scroll_to = None;
         self.cancelling = false;
+        self.picking = false;
         self.outcome = None;
         self.downloads_began = None;
 
@@ -664,6 +724,7 @@ impl PodBatchApp {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let cancel = Cancel::new();
         let proceed = Proceed::new();
+        let skips = Skips::new();
 
         engine::spawn(
             Settings {
@@ -676,13 +737,94 @@ impl PodBatchApp {
             tx,
             cancel.clone(),
             proceed.clone(),
+            skips.clone(),
             Arc::clone(&self.notify),
         );
 
         self.rx = Some(rx);
         self.cancel = Some(cancel);
         self.proceed = Some(proceed);
+        self.skips = Some(skips);
         self.running = true;
+    }
+
+    /// Let the held run go, with whatever is still ticked.
+    ///
+    /// The one way out of the pause, whether the user pressed Download in the
+    /// confirmation box or after picking through the episodes — so the tick
+    /// boxes are handed over on both paths and there is no route that quietly
+    /// ignores them.
+    fn go_ahead(&mut self) {
+        if let Some(skips) = &self.skips {
+            skips.set(self.unticked_episodes());
+        }
+        if let Some(proceed) = &self.proceed {
+            proceed.go();
+        }
+        self.picking = false;
+        self.downloads_began = Some(Instant::now());
+    }
+
+    /// The episodes to leave out, by the numbers the engine knows them under.
+    ///
+    /// `running_map` runs the other way — engine feed to row — so this walks it
+    /// rather than the rows: a podcast that was never ticked has no engine
+    /// number at all, and its episodes are not the engine's to skip.
+    fn unticked_episodes(&self) -> HashSet<(usize, usize)> {
+        let mut out = HashSet::new();
+        for (feed, &row) in self.running_map.iter().enumerate() {
+            let Some(feed_row) = self.feeds.get(row) else {
+                continue;
+            };
+            for (episode, ep) in feed_row.episodes.iter().enumerate() {
+                if !ep.selected {
+                    out.insert((feed, episode));
+                }
+            }
+        }
+        out
+    }
+
+    /// How many episodes pressing Download now would actually fetch.
+    ///
+    /// Counted from the rows rather than from the plan the engine sent, because
+    /// the plan describes the job as it stood before anyone touched it.
+    fn wanted_count(&self) -> usize {
+        self.running_map
+            .iter()
+            .filter_map(|&row| self.feeds.get(row))
+            .flat_map(|feed| &feed.episodes)
+            .filter(|ep| ep.selected && ep.choosable())
+            .count()
+    }
+
+    /// How many episodes are ticked, out of how many are still there to tick.
+    ///
+    /// Both figures leave out the ones already on disk: they are not part of
+    /// the job, so counting them would make "12 of 400" the answer to a run
+    /// with twelve episodes in it.
+    fn episode_tally(&self) -> (usize, usize) {
+        let choosable = self
+            .running_map
+            .iter()
+            .filter_map(|&row| self.feeds.get(row))
+            .flat_map(|feed| &feed.episodes)
+            .filter(|ep| ep.choosable());
+        let total = choosable.clone().count();
+        (choosable.filter(|ep| ep.selected).count(), total)
+    }
+
+    /// Every episode still up for choosing, ticked or not — the list the All and
+    /// None buttons act on while picking.
+    fn set_every_episode(&mut self, selected: bool) {
+        for i in 0..self.running_map.len() {
+            let Some(feed) = self.feeds.get_mut(self.running_map[i]) else {
+                continue;
+            };
+            for ep in feed.episodes.iter_mut().filter(|e| e.choosable()) {
+                ep.selected = selected;
+            }
+        }
     }
 
     /// Do what a shortcut asked for, if it is a thing that can be done now.
@@ -701,8 +843,16 @@ impl PodBatchApp {
                     self.load_opml(path);
                 }
             }
+            // The same chord starts a run and, once one is held open for the
+            // episodes to be picked through, finishes the picking — in both
+            // cases it is the key for "get on with it".
             Action::Start => {
-                if !self.running {
+                if self.picking {
+                    if self.wanted_count() > 0 {
+                        self.tab = Tab::Downloads;
+                        self.go_ahead();
+                    }
+                } else if !self.running {
                     self.tab = Tab::Downloads;
                     self.start();
                 }
@@ -722,30 +872,11 @@ impl PodBatchApp {
             }
             // Ticking is per-tab: the same chord means the podcasts on one and
             // the episodes on the other, so it always acts on the list in view.
-            Action::SelectAll => match self.tab {
-                Tab::Transcripts => {
-                    if !self.transcribing {
-                        self.audio.iter_mut().for_each(|a| a.selected = true);
-                    }
-                }
-                _ => {
-                    if !self.running {
-                        self.feeds.iter_mut().for_each(|f| f.selected = true);
-                    }
-                }
-            },
-            Action::SelectNone => match self.tab {
-                Tab::Transcripts => {
-                    if !self.transcribing {
-                        self.audio.iter_mut().for_each(|a| a.selected = false);
-                    }
-                }
-                _ => {
-                    if !self.running {
-                        self.feeds.iter_mut().for_each(|f| f.selected = false);
-                    }
-                }
-            },
+            // On the Downloads tab it means whichever of the two is being
+            // chosen from — the podcasts before a run, the episodes once one is
+            // held open for them.
+            Action::SelectAll => self.select_every(true),
+            Action::SelectNone => self.select_every(false),
             Action::ChooseAudioFolder => {
                 if !self.transcribing
                     && let Some(dir) = rfd::FileDialog::new()
@@ -765,6 +896,24 @@ impl PodBatchApp {
                 if !self.transcribing && self.dialog.is_none() {
                     self.tab = Tab::Transcripts;
                     self.ask_transcribe();
+                }
+            }
+        }
+    }
+
+    /// Tick or untick everything in the list the user is looking at, if that
+    /// list is theirs to change at all.
+    fn select_every(&mut self, selected: bool) {
+        match self.tab {
+            Tab::Transcripts => {
+                if !self.transcribing {
+                    self.audio.iter_mut().for_each(|a| a.selected = selected);
+                }
+            }
+            _ if self.picking => self.set_every_episode(selected),
+            _ => {
+                if !self.running {
+                    self.feeds.iter_mut().for_each(|f| f.selected = selected);
                 }
             }
         }
@@ -801,6 +950,9 @@ impl PodBatchApp {
         if let Some(cancel) = &self.cancel {
             cancel.cancel();
             self.cancelling = true;
+            // Nothing left to pick from: the run those episodes belonged to is
+            // the one being wound down.
+            self.picking = false;
             self.say(
                 OutputKind::Muted,
                 "Stopping — letting the transfers in flight wind down…".into(),
@@ -834,12 +986,7 @@ impl PodBatchApp {
     fn agreed(&mut self, dialog: Dialog) {
         logs::debug(format!("answered yes to {}", dialog.describe()));
         match dialog {
-            Dialog::Confirm(_) => {
-                if let Some(proceed) = &self.proceed {
-                    proceed.go();
-                }
-                self.downloads_began = Some(Instant::now());
-            }
+            Dialog::Confirm(_) => self.go_ahead(),
             Dialog::Stop => {
                 // Nothing left to confirm: the run they were asked about is the
                 // one they just stopped.
@@ -884,6 +1031,20 @@ impl PodBatchApp {
             // waiting on the answer, so there is nothing to release.
             Dialog::Install { .. } | Dialog::Transcribe { .. } | Dialog::StopTranscribing => {}
         }
+    }
+
+    /// Step out of the confirmation and open the episode lists for ticking.
+    ///
+    /// The engine is left exactly where it was — held on [`Proceed`], with every
+    /// feed read and nothing fetched — because that is the only state in which
+    /// the question this answers can be asked at all.
+    fn pick_episodes(&mut self) {
+        self.picking = true;
+        self.open_episode_lists = true;
+        self.say(
+            OutputKind::Muted,
+            "Choosing episodes — untick anything you don't want, then Download.".into(),
+        );
     }
 
     /// Draw whichever question is open, and act on the answer.
@@ -976,6 +1137,13 @@ impl PodBatchApp {
             _ => None,
         };
 
+        // The confirmation is the only question with a third answer. "Not all of
+        // them" is a reasonable thing to say to "download 40 episodes?", and
+        // this is the only moment it can be said: the feeds have been read, so
+        // the app finally knows what the 40 are, and nothing has been fetched
+        // yet.
+        let choose = matches!(dialog, Dialog::Confirm(_)).then_some("☑ Choose episodes…");
+
         // True only on the frame the box appears, which is also the frame a
         // keypress from before it existed would still be sitting in the queue.
         let first_frame = self.focus_dialog;
@@ -1017,6 +1185,13 @@ impl PodBatchApp {
                     egui::vec2(170.0, CONTROL_HEIGHT),
                     egui::Button::new(no),
                 );
+                let picking = choose.map(|label| {
+                    ui.add_sized(egui::vec2(190.0, CONTROL_HEIGHT), egui::Button::new(label))
+                        .on_hover_text(
+                            "Go through the episode lists first. The run stays where it is \
+                             until you say to start it.",
+                        )
+                });
 
                 // The harmless answer is the one holding focus when the box
                 // appears, so a stray Return does the thing that can be undone.
@@ -1025,10 +1200,13 @@ impl PodBatchApp {
                     self.focus_dialog = false;
                 }
                 if confirm.clicked() {
-                    answer = Some(true);
+                    answer = Some(Answer::Yes);
                 }
                 if cancel.clicked() {
-                    answer = Some(false);
+                    answer = Some(Answer::No);
+                }
+                if picking.is_some_and(|p| p.clicked()) {
+                    answer = Some(Answer::Choose);
                 }
             });
         });
@@ -1040,12 +1218,16 @@ impl PodBatchApp {
         // cancel the run on a press that was meant for whatever came before.
         if !first_frame && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
         {
-            answer = Some(false);
+            answer = Some(Answer::No);
         }
 
         match answer {
-            Some(true) => self.agreed(dialog),
-            Some(false) => self.declined(dialog),
+            Some(Answer::Yes) => self.agreed(dialog),
+            Some(Answer::No) => self.declined(dialog),
+            // Neither answer: the question steps aside rather than being
+            // answered, and the run stays held while the lists are gone
+            // through. Pressing Download afterwards is the yes.
+            Some(Answer::Choose) => self.pick_episodes(),
             None => self.dialog = Some(dialog),
         }
     }
@@ -1093,6 +1275,10 @@ impl PodBatchApp {
                             .map(|e| EpisodeRow {
                                 title: e.title,
                                 file_name: e.file_name,
+                                // Ticked, like the podcasts: the common case is
+                                // "download the lot", and this list is far
+                                // longer than that one.
+                                selected: true,
                                 status: EpisodeStatus::Pending,
                                 done: 0,
                                 total: e.size_hint,
@@ -1112,6 +1298,14 @@ impl PodBatchApp {
                         continue;
                     };
                     ep.status = status.clone();
+
+                    // An episode already on disk is not part of the job, so its
+                    // tick box has nothing left to decide — and a ticked box
+                    // next to an episode that will not be downloaded is a
+                    // promise the run has no intention of keeping.
+                    if matches!(status, EpisodeStatus::Skipped) {
+                        ep.selected = false;
+                    }
 
                     // One line per episode as it settles, which is what makes
                     // the output box a record of the run rather than a log of
@@ -1135,6 +1329,14 @@ impl PodBatchApp {
                             OutputKind::Muted,
                             logs::Outcome::Skipped,
                             format!("{MARK_SKIPPED} {show} — {title} → {file} (already downloaded)"),
+                        ),
+                        // No file name on this one: it never got as far as
+                        // being a file, and naming one that was never written
+                        // reads like it is sitting there.
+                        EpisodeStatus::Unticked => self.say_as(
+                            OutputKind::Muted,
+                            logs::Outcome::Skipped,
+                            format!("{MARK_SKIPPED} {show} — {title} (left out)"),
                         ),
                         EpisodeStatus::Failed(e) => {
                             want(CUE_SOMETHING_FAILED, Cue::Failure);
@@ -1193,8 +1395,10 @@ impl PodBatchApp {
                     self.note_rate(cancelled);
                     self.running = false;
                     self.cancelling = false;
+                    self.picking = false;
                     self.cancel = None;
                     self.proceed = None;
+                    self.skips = None;
                     self.rx = None;
                     // A question about a run that has ended has nothing left to
                     // ask; a window closed under a modal that outlived it would
@@ -1331,7 +1535,32 @@ impl PodBatchApp {
             }
 
             let ready = self.selected_count() > 0;
-            if self.running {
+            if self.picking {
+                // The run is held, so this is the button that finishes the job
+                // rather than one that starts it — and it counts what is
+                // actually ticked, which is the number that changes as the user
+                // works down the list.
+                let wanted = self.wanted_count();
+                let response = ui.add_enabled(
+                    wanted > 0,
+                    egui::Button::new(format!("▶ Download {}", count(wanted, "episode")))
+                        .min_size(egui::vec2(240.0, CONTROL_HEIGHT)),
+                );
+                if wanted == 0 {
+                    response.on_hover_text("Nothing is ticked — tick an episode, or Stop.");
+                } else if response.clicked() {
+                    self.go_ahead();
+                }
+                if ui
+                    .add_enabled(
+                        self.dialog.is_none(),
+                        egui::Button::new("■ Stop").min_size(egui::vec2(120.0, CONTROL_HEIGHT)),
+                    )
+                    .clicked()
+                {
+                    self.ask(Dialog::Stop);
+                }
+            } else if self.running {
                 let label = if self.cancelling { "Stopping…" } else { "■ Stop" };
                 if ui
                     .add_enabled(
@@ -1356,7 +1585,12 @@ impl PodBatchApp {
             }
 
             let muted = theme::palette(ui.visuals()).muted;
-            if !self.feeds.is_empty() {
+            if self.picking {
+                let (ticked, total) = self.episode_tally();
+                ui.label(
+                    RichText::new(format!("{ticked} of {total} episodes ticked")).color(muted),
+                );
+            } else if !self.feeds.is_empty() {
                 ui.label(
                     RichText::new(format!(
                         "{} of {} selected",
@@ -1385,25 +1619,34 @@ impl PodBatchApp {
         });
     }
 
-    /// The left half: the podcasts in the OPML, and which of them to fetch.
+    /// The left half: the podcasts in the OPML, and which of them to fetch —
+    /// and, once their feeds have been read, which episodes of each.
+    ///
+    /// The two lists are the same list at different depths, and which one is
+    /// live depends on where the run has got to. Before a run there is nothing
+    /// but podcast titles to choose from, because nothing has asked a feed what
+    /// is in it. While one is held at the confirmation there is, and that is
+    /// the moment [`PodBatchApp::picking`] opens up.
     fn feed_pane(&mut self, ui: &mut Ui) {
         let busy = self.running;
+        let picking = self.picking;
         let palette = theme::palette(ui.visuals());
 
         ui.horizontal(|ui| {
+            // Still "Podcasts", even while the episodes are what is being
+            // chosen: the top of this list is podcast names either way, and a
+            // heading that said "Episodes" over them would be describing a
+            // different list from the one underneath it.
             ui.label(RichText::new("Podcasts").strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add_enabled(!busy && !self.feeds.is_empty(), egui::Button::new("None"))
-                    .clicked()
-                {
-                    self.feeds.iter_mut().for_each(|f| f.selected = false);
+                // The buttons act on whichever list is the live one, which is
+                // the same rule the Cmd+A shortcut follows.
+                let usable = !self.feeds.is_empty() && (picking || !busy);
+                if ui.add_enabled(usable, egui::Button::new("None")).clicked() {
+                    self.select_every(false);
                 }
-                if ui
-                    .add_enabled(!busy && !self.feeds.is_empty(), egui::Button::new("All"))
-                    .clicked()
-                {
-                    self.feeds.iter_mut().for_each(|f| f.selected = true);
+                if ui.add_enabled(usable, egui::Button::new("All")).clicked() {
+                    self.select_every(true);
                 }
             });
         });
@@ -1417,45 +1660,28 @@ impl PodBatchApp {
             return;
         }
 
+        if picking {
+            ui.label(
+                RichText::new("Untick anything you don't want, then press Download.")
+                    .color(palette.muted)
+                    .small(),
+            );
+        }
+
+        // Every list open, once, on the frame picking begins — a pane of shut
+        // arrows is a feature nobody finds. Only when there are few enough of
+        // them to be worth drawing: an unlimited run over a large subscription
+        // list is thousands of rows, and egui lays out every one of them on
+        // every frame whether or not it is on screen.
+        let open_all = std::mem::take(&mut self.open_episode_lists)
+            && self.episode_tally().1 <= OPEN_EVERY_LIST_UNDER;
+
         egui::ScrollArea::vertical()
             .id_salt("feeds")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                for feed in &mut self.feeds {
-                    ui.horizontal(|ui| {
-                        // The status is laid out first, from the right, so that
-                        // it has claimed its width before the title is asked to
-                        // fit. A truncating title placed first takes the whole
-                        // row and the status then draws on top of it.
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let (text, colour) = feed_status(feed, &palette);
-                            if !text.is_empty() {
-                                ui.label(RichText::new(text).color(colour).small());
-                            }
-
-                            ui.with_layout(
-                                egui::Layout::left_to_right(egui::Align::Center),
-                                |ui| {
-                                    // The title is the tick box's own label
-                                    // rather than a separate one next to it.
-                                    // That label is what egui hands to the
-                                    // screen reader as the control's name, and
-                                    // an unnamed tick box in a list of forty
-                                    // podcasts is announced as "checkbox",
-                                    // forty times over.
-                                    ui.style_mut().wrap_mode =
-                                        Some(egui::TextWrapMode::Truncate);
-                                    let title =
-                                        egui::Atom::from(feed.title.as_str()).atom_shrink(true);
-                                    ui.add_enabled(
-                                        !busy,
-                                        egui::Checkbox::new(&mut feed.selected, title),
-                                    )
-                                    .on_hover_text(&feed.url);
-                                },
-                            );
-                        });
-                    });
+                for (index, feed) in self.feeds.iter_mut().enumerate() {
+                    feed_row(ui, index, feed, &palette, busy, picking, open_all);
                 }
             });
     }
@@ -1577,6 +1803,9 @@ impl PodBatchApp {
             // reads like a failure, so a run that hasn't happened says so.
             let headline = if self.feeds.is_empty() || (!self.running && self.outcome.is_none()) {
                 "Ready.".to_string()
+            } else if self.picking {
+                let (ticked, total) = self.episode_tally();
+                format!("Choosing episodes — {ticked} of {total} ticked")
             } else if matches!(self.dialog, Some(Dialog::Confirm(_))) {
                 "Feeds read — waiting for you".to_string()
             } else if self.running && !self.all_listed() {
@@ -1614,6 +1843,11 @@ impl PodBatchApp {
                 ui.label(
                     RichText::new(format!("· {} already had", totals.skipped))
                         .color(palette.muted),
+                );
+            }
+            if totals.unticked > 0 {
+                ui.label(
+                    RichText::new(format!("· {} left out", totals.unticked)).color(palette.muted),
                 );
             }
             if totals.failed > 0 {
@@ -2662,6 +2896,131 @@ fn audio_status(row: &AudioRow, palette: &theme::Palette) -> (String, egui::Colo
     }
 }
 
+/// One podcast in the list: its tick box and status, with its episodes folded
+/// away underneath once the feed has been read.
+///
+/// Folded rather than laid out flat because a subscription list of forty
+/// podcasts is a few thousand episodes, and a pane that opens on all of them at
+/// once is one nobody can find a podcast in.
+fn feed_row(
+    ui: &mut Ui,
+    index: usize,
+    feed: &mut FeedRow,
+    palette: &theme::Palette,
+    busy: bool,
+    picking: bool,
+    open: bool,
+) {
+    if feed.episodes.is_empty() {
+        // Nothing to open: a podcast whose feed has not been read, or one that
+        // turned out to carry no downloadable media. An arrow beside it would
+        // promise a list that does not exist.
+        ui.horizontal(|ui| feed_header(ui, feed, palette, busy));
+        return;
+    }
+
+    // The open/shut state lives in egui's memory against this id, so a podcast
+    // the user opened stays open across the frames a running download repaints.
+    let id = ui.make_persistent_id(("feed-episodes", index));
+    let mut state =
+        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
+    if open {
+        state.set_open(true);
+    }
+    state
+        .show_header(ui, |ui| feed_header(ui, feed, palette, busy))
+        .body(|ui| {
+            for episode in &mut feed.episodes {
+                // A podcast that is not itself ticked has no episodes to
+                // choose from — none of them is going to be fetched either way.
+                episode_row(ui, episode, palette, picking && feed.selected);
+            }
+        });
+}
+
+/// A podcast's own row: the tick box, named after the podcast, and whatever the
+/// run has to say about it.
+fn feed_header(ui: &mut Ui, feed: &mut FeedRow, palette: &theme::Palette, busy: bool) {
+    // The status is laid out first, from the right, so that it has claimed its
+    // width before the title is asked to fit. A truncating title placed first
+    // takes the whole row and the status then draws on top of it.
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        let (text, colour) = feed_status(feed, palette);
+        if !text.is_empty() {
+            ui.label(RichText::new(text).color(colour).small());
+        }
+
+        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            // The title is the tick box's own label rather than a separate one
+            // next to it. That label is what egui hands to the screen reader as
+            // the control's name, and an unnamed tick box in a list of forty
+            // podcasts is announced as "checkbox", forty times over.
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+            let title = egui::Atom::from(feed.title.as_str()).atom_shrink(true);
+            ui.add_enabled(!busy, egui::Checkbox::new(&mut feed.selected, title))
+                .on_hover_text(&feed.url);
+        });
+    });
+}
+
+/// One episode under its podcast. Laid out like the row above it on purpose:
+/// the tick box carries the name, and the status sits out to the right.
+fn episode_row(
+    ui: &mut Ui,
+    episode: &mut EpisodeRow,
+    palette: &theme::Palette,
+    choosable: bool,
+) {
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let (text, colour) = episode_status(episode, palette);
+            if !text.is_empty() {
+                ui.label(RichText::new(text).color(colour).small());
+            }
+
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                let title = egui::Atom::from(episode.title.as_str()).atom_shrink(true);
+                ui.add_enabled(
+                    choosable && episode.choosable(),
+                    egui::Checkbox::new(&mut episode.selected, title),
+                )
+                // Truncated titles are the rule in a pane this narrow, so the
+                // whole one is worth having on hover — with the file it will
+                // land in under it, which is a timestamp and says nothing on
+                // its own.
+                .on_hover_text(format!("{}\n{}", episode.title, episode.file_name));
+            });
+        });
+    });
+}
+
+/// The status an episode row reports on the right of its name.
+fn episode_status(episode: &EpisodeRow, palette: &theme::Palette) -> (String, egui::Color32) {
+    match &episode.status {
+        // Before it starts, the only thing worth saying is how big it is — and
+        // only when the feed bothered to declare it.
+        EpisodeStatus::Pending => (
+            episode.total.map(human_bytes).unwrap_or_default(),
+            palette.muted,
+        ),
+        EpisodeStatus::Downloading => (
+            match episode.total {
+                Some(total) if total > 0 => {
+                    format!("{}%", (episode.done * 100 / total).min(100))
+                }
+                _ => human_bytes(episode.done),
+            },
+            palette.accent,
+        ),
+        EpisodeStatus::Done => (human_bytes(episode.done), palette.ok),
+        EpisodeStatus::Skipped => ("already here".to_string(), palette.muted),
+        EpisodeStatus::Unticked => ("left out".to_string(), palette.muted),
+        EpisodeStatus::Cancelled => ("stopped".to_string(), palette.muted),
+        EpisodeStatus::Failed(e) => (e.clone(), palette.bad),
+    }
+}
+
 /// The status a podcast row reports on the right of its name.
 fn feed_status(feed: &FeedRow, palette: &theme::Palette) -> (String, egui::Color32) {
     match &feed.status {
@@ -2818,9 +3177,10 @@ impl PodBatchApp {
 
         // The engine wakes us on every message, but a download reports at most
         // ten times a second and the spinner needs a steadier clock than that.
-        // Not while the run is held at the confirmation box: nothing is moving
-        // there, and there is nothing to animate.
-        if self.running && !matches!(self.dialog, Some(Dialog::Confirm(_))) {
+        // Not while the run is held at the confirmation box, or while the
+        // episodes are being picked through: nothing is moving there, and there
+        // is nothing to animate.
+        if self.running && !self.picking && !matches!(self.dialog, Some(Dialog::Confirm(_))) {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
@@ -2961,6 +3321,7 @@ mod tests {
         EpisodeRow {
             title: "t".into(),
             file_name: "t.mp3".into(),
+            selected: true,
             status,
             done,
             total: None,
@@ -3114,6 +3475,11 @@ mod tests {
             // The two dialogs, which write the same marks on their buttons.
             "▶ Download",
             "Keep downloading",
+            // Picking through the episodes: the third button on the
+            // confirmation, and what the bar says once it has been pressed.
+            "☑ Choose episodes…",
+            "▶ Download 12 episodes",
+            "Choosing episodes — untick anything you don't want, then Download.",
             "How long that takes is anyone's guess — there was nothing to measure your \
              connection against.",
         ];
@@ -3299,6 +3665,272 @@ mod tests {
         );
     }
 
+    /// The third answer to the confirmation leaves the engine exactly where it
+    /// was. Answering it either way is a decision; this is the user saying they
+    /// have not made one yet, and the run has to still be there when they do.
+    #[test]
+    fn choosing_episodes_steps_aside_from_the_question_without_answering_it() {
+        let mut app = test_app();
+        app.running = true;
+        app.cancel = Some(Cancel::new());
+        app.proceed = Some(Proceed::new());
+        app.skips = Some(Skips::new());
+
+        app.pick_episodes();
+        assert!(app.picking);
+        assert!(!app.cancelling, "the run was stopped rather than held");
+        assert!(
+            app.downloads_began.is_none(),
+            "nothing is downloading yet — the engine has not been let go"
+        );
+    }
+
+    /// And what the engine is handed when it finally is let go: the episodes
+    /// that were un-ticked, under the numbers the engine knows them by rather
+    /// than the window's own row numbers.
+    #[test]
+    fn going_ahead_hands_over_what_was_unticked_and_releases_the_engine() {
+        let mut app = test_app();
+        let skips = Skips::new();
+        app.running = true;
+        app.picking = true;
+        app.proceed = Some(Proceed::new());
+        app.skips = Some(skips.clone());
+
+        // Three podcasts, the first of them never ticked — so the engine was
+        // told about two, and they are its feeds 0 and 1.
+        app.feeds = vec![
+            feed(false, vec![episode(EpisodeStatus::Pending, 0)]),
+            feed(true, vec![episode(EpisodeStatus::Pending, 0)]),
+            feed(
+                true,
+                vec![
+                    episode(EpisodeStatus::Pending, 0),
+                    episode(EpisodeStatus::Pending, 0),
+                ],
+            ),
+        ];
+        app.running_map = vec![1, 2];
+
+        // The middle episode of the last podcast is the one nobody wants.
+        app.feeds[2].episodes[0].selected = false;
+        assert_eq!(app.wanted_count(), 2);
+        assert_eq!(app.episode_tally(), (2, 3));
+
+        app.go_ahead();
+
+        assert!(skips.holds(1, 0), "the un-ticked episode was not handed over");
+        assert!(!skips.holds(1, 1), "its neighbour was taken out with it");
+        assert!(!skips.holds(0, 0));
+        // The un-ticked podcast is not the engine's to skip: it was never in
+        // the run, so there is no number under which to name its episodes.
+        assert!(!skips.holds(2, 0), "a row number leaked through as a feed number");
+
+        assert!(!app.picking, "the picking outlived the run it was for");
+        assert!(app.downloads_began.is_some());
+    }
+
+    /// Plain agreement takes the same road, so the ticks are handed over on
+    /// both paths — including the one where nobody touched them.
+    #[test]
+    fn agreeing_without_picking_leaves_every_episode_in() {
+        let mut app = test_app();
+        let skips = Skips::new();
+        app.running = true;
+        app.proceed = Some(Proceed::new());
+        app.skips = Some(skips.clone());
+        app.feeds = vec![feed(true, vec![episode(EpisodeStatus::Pending, 0)])];
+        app.running_map = vec![0];
+
+        app.agreed(Dialog::Confirm(Plan::default()));
+        assert!(!skips.holds(0, 0));
+        assert!(app.downloads_began.is_some());
+    }
+
+    /// Episodes arrive from the engine ticked, and an episode it then reports as
+    /// already on disk unticks itself — a ticked box beside an episode that will
+    /// not be fetched is a promise the run has no intention of keeping.
+    #[test]
+    fn episodes_arrive_ticked_and_the_ones_already_here_untick_themselves() {
+        let mut app = test_app();
+        app.feeds = vec![feed(true, vec![])];
+        app.running_map = vec![0];
+        app.running = true;
+
+        drive(
+            &mut app,
+            vec![
+                Update::Episodes {
+                    feed: 0,
+                    episodes: vec![
+                        engine::EpisodeInfo {
+                            title: "One".into(),
+                            file_name: "050825-1000.mp3".into(),
+                            size_hint: Some(1024),
+                        },
+                        engine::EpisodeInfo {
+                            title: "Two".into(),
+                            file_name: "060825-1000.mp3".into(),
+                            size_hint: None,
+                        },
+                    ],
+                },
+                Update::EpisodeStatus {
+                    feed: 0,
+                    episode: 1,
+                    status: EpisodeStatus::Skipped,
+                },
+            ],
+        );
+
+        let episodes = &app.feeds[0].episodes;
+        assert!(episodes[0].selected, "a new episode starts ticked");
+        assert!(episodes[0].choosable());
+        assert!(!episodes[1].selected, "one already on disk is not part of the job");
+        assert!(!episodes[1].choosable());
+
+        // And the counts leave it out of both halves, so the bar doesn't read
+        // "1 of 2" for a run with one episode in it.
+        assert_eq!(app.episode_tally(), (1, 1));
+        assert_eq!(app.wanted_count(), 1);
+    }
+
+    /// An episode the user left out is reported as left out, and not as one the
+    /// app happened to already have — the two are different answers to "why is
+    /// this not here?", and only one of them is anybody's decision.
+    #[test]
+    fn a_left_out_episode_is_reported_as_a_choice_rather_than_a_coincidence() {
+        let mut app = test_app();
+        app.feeds = vec![feed(true, vec![])];
+        app.running_map = vec![0];
+        app.running = true;
+
+        drive(
+            &mut app,
+            vec![
+                Update::Episodes {
+                    feed: 0,
+                    episodes: vec![engine::EpisodeInfo {
+                        title: "One".into(),
+                        file_name: "050825-1000.mp3".into(),
+                        size_hint: Some(1024),
+                    }],
+                },
+                Update::EpisodeStatus {
+                    feed: 0,
+                    episode: 0,
+                    status: EpisodeStatus::Unticked,
+                },
+            ],
+        );
+
+        let said = app.output.last().map(|l| l.text.clone()).unwrap_or_default();
+        assert!(said.contains("left out"), "{said}");
+        assert!(!said.contains("already downloaded"), "{said}");
+
+        // Left out is a finished episode, or the bar would sit short of the end
+        // for a run that has nothing left to do.
+        let totals = app.totals();
+        assert_eq!(totals.episodes, 1);
+        assert_eq!(totals.finished, 1);
+        assert_eq!(totals.unticked, 1);
+        assert_eq!(totals.skipped, 0);
+    }
+
+    /// Ticking follows the list in front of the user, and while the episodes are
+    /// being picked through that list is the episodes — not the podcasts, whose
+    /// selection the run in progress is already built on.
+    #[test]
+    fn ticking_while_picking_acts_on_the_episodes() {
+        let mut app = test_app();
+        app.running = true;
+        app.picking = true;
+        app.feeds = vec![feed(
+            true,
+            vec![
+                episode(EpisodeStatus::Pending, 0),
+                // Already on disk: not the user's to choose, either way.
+                episode(EpisodeStatus::Skipped, 0),
+            ],
+        )];
+        app.feeds[0].episodes[1].selected = false;
+        app.running_map = vec![0];
+
+        app.perform(Action::SelectNone);
+        assert!(!app.feeds[0].episodes[0].selected);
+        assert!(app.feeds[0].selected, "the podcast selection is not this button's");
+
+        app.perform(Action::SelectAll);
+        assert!(app.feeds[0].episodes[0].selected);
+        assert!(
+            !app.feeds[0].episodes[1].selected,
+            "an episode already on disk was ticked back on"
+        );
+    }
+
+    /// Stopping while picking ends the picking too: the episodes being chosen
+    /// from belong to the run that was just wound down.
+    #[test]
+    fn stopping_while_picking_ends_the_picking() {
+        let mut app = test_app();
+        app.running = true;
+        app.picking = true;
+        app.cancel = Some(Cancel::new());
+
+        app.perform(Action::Stop);
+        let dialog = app.dialog.take().expect("dialog");
+        app.agreed(dialog);
+
+        assert!(app.cancelling);
+        assert!(!app.picking);
+    }
+
+    /// The episode list, drawn for real: the tick boxes have to actually be on
+    /// screen, with the button that acts on them, or the choosing is a field
+    /// nothing reads.
+    #[test]
+    fn picking_paints_the_episodes_and_the_button_that_starts_them() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+
+        let mut app = test_app();
+        app.running = true;
+        app.cancel = Some(Cancel::new());
+        app.proceed = Some(Proceed::new());
+        app.skips = Some(Skips::new());
+        app.feeds = vec![feed(
+            true,
+            vec![
+                episode(EpisodeStatus::Pending, 0),
+                episode(EpisodeStatus::Pending, 0),
+            ],
+        )];
+        app.feeds[0].episodes[0].title = "The one about badgers".into();
+        app.feeds[0].episodes[1].title = "The one about otters".into();
+        app.running_map = vec![0];
+        app.pick_episodes();
+
+        paint_frame(&ctx, &mut app);
+        let painted = paint_frame(&ctx, &mut app);
+
+        assert!(painted.contains("The one about badgers"), "{painted}");
+        assert!(painted.contains("The one about otters"), "{painted}");
+        assert!(painted.contains("▶ Download 2 episodes"), "{painted}");
+        assert!(painted.contains("Untick anything you don't want"), "{painted}");
+    }
+
+    /// Push a batch of engine updates through the window the way a real frame
+    /// does, so the handling and the state it leaves behind are tested together.
+    fn drive(app: &mut PodBatchApp, updates: Vec<Update>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        for update in updates {
+            tx.send(update).expect("send");
+        }
+        drop(tx);
+        app.rx = Some(rx);
+        app.drain();
+    }
+
     /// What the box actually says. The numbers are the whole reason it exists,
     /// so each one has to survive the sentence it is put in.
     #[test]
@@ -3404,6 +4036,9 @@ mod tests {
         );
         assert!(painted.contains("40.0 MB to fetch"), "{painted}");
         assert!(painted.contains("1.0 MB/s"), "{painted}");
+        // "Not all of them" is only ever a reasonable answer to this question,
+        // so this is the one box that offers it.
+        assert!(painted.contains("☑ Choose episodes…"), "{painted}");
 
         // Then Escape, which the dialog must take before the shortcut table can
         // read it as "stop the run".
@@ -3974,6 +4609,9 @@ mod tests {
             outcome: None,
             cancel: None,
             proceed: None,
+            skips: None,
+            open_episode_lists: false,
+            picking: false,
             rx: None,
             notify: Arc::new(|| {}),
             dialog: None,
