@@ -1,6 +1,6 @@
 [package]
 name = "podbatch"
-version = "1.5.2"
+version = "1.5.3"
 edition = "2024"
 rust-version = "1.88"
 description = "Podcast Downloader: point it at an OPML subscription list and it downloads the episodes, one folder per podcast."
