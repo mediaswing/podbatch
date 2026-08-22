@@ -21,8 +21,16 @@ use crate::logs;
 /// The tinydiarize model: `small.en`, retrained to mark where the speaker
 /// changes. It is the only Whisper model that emits `[SPEAKER_TURN]`, which is
 /// the whole reason the transcripts can be broken into speakers at all.
-pub const MODEL_URL: &str =
-    "https://huggingface.co/akashmjn/tinydiarize-whisper.cpp/resolve/main/ggml-small.en-tdrz.bin";
+///
+/// Pinned to a commit rather than to `main`. A branch is only ever whatever it
+/// was last pointed at, so fetching from one leaves the file that arrives to be
+/// decided by the repository at download time rather than by us — and what
+/// arrives goes straight to whisper.cpp's ggml loader, a C parser that does no
+/// favours for a file it did not expect. The pin is what makes [`MODEL_SHA256`]
+/// a promise rather than a description: a repository that moves `main` on now
+/// changes neither the bytes we ask for nor the hash they have to match.
+pub const MODEL_URL: &str = "https://huggingface.co/akashmjn/tinydiarize-whisper.cpp/resolve/\
+     d44ba793fc67e509623a88a409723311fa677744/ggml-small.en-tdrz.bin";
 pub const MODEL_FILE: &str = "ggml-small.en-tdrz.bin";
 /// What the download costs, so the user is told before agreeing rather than
 /// after. Checked against the real file by `tests::the_model_size_is_honest`,
@@ -977,13 +985,16 @@ mod tests {
     /// the right size that is not the model must not be loadable.
     #[test]
     fn the_model_is_pinned_to_a_hash() {
-        let Install::Download { sha256, bytes, .. } = plan(Tool::WhisperModel, None) else {
+        let Install::Download { sha256, bytes, url, .. } = plan(Tool::WhisperModel, None) else {
             panic!("expected a download");
         };
         assert_eq!(sha256.as_deref(), Some(MODEL_SHA256));
         assert_eq!(bytes, MODEL_BYTES);
         assert_eq!(MODEL_SHA256.len(), 64);
         assert!(MODEL_SHA256.chars().all(|c| c.is_ascii_hexdigit()));
+        // And to a commit. Asking a branch for the file would put the answer
+        // back in the repository's hands, whatever the hash below says.
+        assert!(!url.contains("/resolve/main/"), "{url} asks a branch for the model");
     }
 
     /// `cmd /c start` will happily act on things that are not web addresses.
